@@ -8,7 +8,7 @@ job's own `GITHUB_TOKEN`.
 | Workflow | Runs on | What it does |
 |---|---|---|
 | [`ci.yml`](../.github/workflows/ci.yml) | every pull request, weekly (Mondays), manual | `ci/lint.sh`; `ci/test.sh` (`cargo test --locked`) and an image build + start of `hbbs`/`hbbr`, on a native amd64 and a native arm64 runner (no QEMU); a gitleaks scan of the pull request's commits; a Trivy scan of the built image. The check to require is **CI result**. |
-| [`publish.yml`](../.github/workflows/publish.yml) | push to `master` touching `src/**`, `libs/**`, `Cargo.*`, `build.rs`, `Dockerfile`, `.dockerignore` or `VERSION`; tags `vX.Y.Z`; manual (master or a tag only) | Builds each architecture natively, pushes it to GHCR by digest, smoke-tests the pushed digest (`hbbs --help`, `hbbr --help`, and both start and stay up), merges the two into one manifest list (`linux/amd64`, `linux/arm64` only), tags it, signs it with cosign and attests its provenance. On a tag it also creates the GitHub Release. |
+| [`publish.yml`](../.github/workflows/publish.yml) | on request only: a pushed tag `vX.Y.Z`, or manual "Run workflow" (master or a tag only) | Builds each architecture natively, pushes it to GHCR by digest, smoke-tests the pushed digest (`hbbs --help`, `hbbr --help`, and both start and stay up), merges the two into one manifest list (`linux/amd64`, `linux/arm64` only), tags it, signs it with cosign and attests its provenance. On a tag it also creates the GitHub Release. |
 
 ## Scripts
 
@@ -46,7 +46,7 @@ visible in the image labels `io.patina.upstream.repo` and `io.patina.upstream.co
 
 | Event | Tags |
 |---|---|
-| push to `master` (code/build paths) | `edge`, `sha-<short>` |
+| "Run workflow" on `master` (manual only; merges publish nothing) | `edge`, `sha-<short>` |
 | tag `vX.Y.Z` | `X.Y.Z`, `X.Y`, `latest`, `sha-<short>` |
 
 Standard OCI labels are set too: title `patina`, source, revision, version, licenses `AGPL-3.0-only`.
@@ -65,7 +65,7 @@ cosign verify ghcr.io/<owner>/patina@sha256:<digest> \
 ## Cutting a release
 
 1. Open a pull request that changes `VERSION` (for example `0.1.0` to `0.2.0`); merge it once
-   **CI result** is green. The merge also publishes `edge`.
+   **CI result** is green. The merge publishes nothing by itself.
 2. Tag that commit on `master` and push the tag (signed tags are preferred):
    `git tag -s v0.2.0 && git push origin v0.2.0`.
 3. `publish.yml` fails if the tag differs from `VERSION` or is not on `master`. Otherwise it

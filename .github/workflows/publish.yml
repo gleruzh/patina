@@ -11,25 +11,17 @@
 # See docs/ci.md.
 name: Publish
 
+# Only on request: pushing a vX.Y.Z tag (release) or "Run workflow" (on master: edge build).
+# A merge to master publishes nothing by itself.
 on:
   push:
-    branches: [master]
-    paths:
-      - src/**
-      - libs/**
-      - Cargo.*
-      - build.rs
-      - Dockerfile
-      - .dockerignore
-      - VERSION
     tags: ['v*.*.*']
   workflow_dispatch:
 
 permissions: {}
 
-# One run at a time per ref, never cancelled halfway: two runs of master do not move the edge tag at
-# the same time, and a tag is not displaced by a push to master that is waiting (GitHub keeps one
-# waiting run per group).
+# One run at a time per ref, never cancelled halfway: two manual runs of master do not move the edge
+# tag at the same time, and runs for different refs do not displace each other.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
@@ -240,7 +232,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # master push: edge, sha-<short>. Tag vX.Y.Z: X.Y.Z, X.Y, latest, sha-<short>.
+      # Manual run on master: edge, sha-<short>. Tag vX.Y.Z: X.Y.Z, X.Y, latest, sha-<short>.
       - name: Tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
