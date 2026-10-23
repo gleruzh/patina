@@ -1,0 +1,234 @@
+# Disposable end-to-end bench for WebSocket device registration.
+# Driven by scripts/*.sh; see README.md. Every resource is named patina-e2e-*.
+#
+#   wan 10.231.1.0/24   devices, NAT router, attacker   -> nginx .10, edge .11
+#   ctl 10.231.2.0/24   controllers (separate netns)    -> nginx .10, edge .11
+#   lan 10.231.3.0/24   behind NAT router .2             -> two WS devices
+#   proxy 10.231.4.0/24 nginx .10 and edge .11 only (like a reverse proxy joining
+#                       rustdesk-net); TRUSTED_PROXY_CIDRS is this subnet
+#
+# "edge" owns the server IP; hbbs and hbbr join its network namespace so one
+# address serves 21115-21119 like the production host. WS clients resolve the
+# domain to nginx (443 only); UDP-mode clients resolve it to edge.
+name: patina-e2e
+
+x-client: &client
+  image: ${CLIENT_IMAGE:-patina-e2e-client:1.5.0}
+  cap_add: [NET_ADMIN]
+  shm_size: 256m
+  environment: &client-env
+    RD_DOMAIN: rd.e2e.test
+    RD_KEY: ${RD_KEY:-}
+    RD_PASSWORD: ${RD_PASSWORD:-E2e-Pass-4821}
+  volumes:
+    - ${E2E_STATE:?run via scripts/}/certs/ca.crt:/ca/ca.crt:ro
+    - ${E2E_STATE}/out:/artifacts
+
+services:
+  edge:
+    image: ${TOOLS_IMAGE:-patina-e2e-client:1.5.0}
+    container_name: patina-e2e-edge
+    entrypoint: ["sleep", "infinity"]
+    # hbbs resolves its -r hosts at startup and drops unresolvable ones; the
+    # domain is the server's own address, as on the production host.
+    extra_hosts: ["rd.e2e.test:10.231.1.11"]
+    networks:
+      wan: { ipv4_address: 10.231.1.11 }
+      ctl: { ipv4_address: 10.231.2.11 }
+      proxy: { ipv4_address: 10.231.4.11 }
+
+  hbbs:
+    image: ${HBBS_IMAGE:-patina-e2e-hbbs:stock-873230e}
+    container_name: patina-e2e-hbbs
+    network_mode: service:edge
+    depends_on: [edge]
+    command: ["hbbs", "-r", "rd.e2e.test", "-k", "_"]
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUST_LOG: ${HBBS_RUST_LOG:-info}
+      WS_REGISTER: ${WS_REGISTER:-Y}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-10.231.4.0/24}
+    volumes:
+      - patina-e2e-hbbs-data:/data
+
+  hbbr:
+    image: ${HBBR_IMAGE:-patina-e2e-hbbs:stock-873230e}
+    container_name: patina-e2e-hbbr
+    network_mode: service:edge
+    depends_on: [edge, hbbs]
+    command: ["hbbr", "-k", "_"]
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      RUST_LOG: info
+    volumes:
+      - patina-e2e-hbbs-data:/data
+
+  nginx:
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10}
+    container_name: patina-e2e-nginx
+    depends_on: [edge]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${E2E_STATE}/certs:/certs:ro
+    networks:
+      wan: { ipv4_address: 10.231.1.10 }
+      ctl: { ipv4_address: 10.231.2.10 }
+      proxy: { ipv4_address: 10.231.4.10 }
+
+  # --- WS-only target: stock 1.5.0, only tcp/443 to nginx allowed ---------
+  ws-device:
+    <<: *client
+    container_name: patina-e2e-ws-device
+    hostname: ws-device
+    profiles: [ws]
+    environment:
+      <<: *client-env
+      RD_ROLE: device
+      RD_NET_MODE: ws
+      RD_FIREWALL: ws-only
+      RD_SERVER: rd.e2e.test
+      PROXY_IP: 10.231.1.10
+      RD_BG: "#2e7d32"
+    extra_hosts: ["rd.e2e.test:10.231.1.10"]
+    networks:
+      wan: { ipv4_address: 10.231.1.21 }
+    volumes:
+      - ${E2E_STATE}/certs/ca.crt:/ca/ca.crt:ro
+      - ${E2E_STATE}/out:/artifacts
+      - patina-e2e-ws-device-home:/home/rd
+
+  # --- WS controller on the ctl network ------------------------------------
+  ws-controller:
+    <<: *client
+    container_name: patina-e2e-ws-controller
+    hostname: ws-controller
+    profiles: [ws]
+    environment:
+      <<: *client-env
+      RD_ROLE: controller
+      RD_NET_MODE: ws
+      RD_FIREWALL: ws-only
+      RD_SERVER: rd.e2e.test
+      PROXY_IP: 10.231.2.10
+      RD_BG: "#37474f"
+    extra_hosts: ["rd.e2e.test:10.231.2.10"]
+    networks:
+      ctl: { ipv4_address: 10.231.2.21 }
+
+  # --- UDP-mode (classic) device and controller: regression -----------------
+  udp-device:
+    <<: *client
+    container_name: patina-e2e-udp-device
+    hostname: udp-device
+    profiles: [udp]
+    environment:
+      <<: *client-env
+      RD_ROLE: device
+      RD_NET_MODE: udp
+      RD_SERVER: rd.e2e.test
+      RD_BG: "#1565c0"
+    extra_hosts: ["rd.e2e.test:10.231.1.11"]
+    networks:
+      wan: { ipv4_address: 10.231.1.22 }
+
+  udp-controller:
+    <<: *client
+    container_name: patina-e2e-udp-controller
+    hostname: udp-controller
+    profiles: [udp]
+    environment:
+      <<: *client-env
+      RD_ROLE: controller
+      RD_NET_MODE: udp
+      RD_SERVER: rd.e2e.test
+      RD_BG: "#4e342e"
+    extra_hosts: ["rd.e2e.test:10.231.2.11"]
+    networks:
+      ctl: { ipv4_address: 10.231.2.22 }
+
+  # --- Two WS devices behind one NAT ---------------------------------------
+  nat-router:
+    image: ${TOOLS_IMAGE:-patina-e2e-client:1.5.0}
+    container_name: patina-e2e-nat-router
+    profiles: [nat]
+    cap_add: [NET_ADMIN]
+    sysctls: { net.ipv4.ip_forward: "1" }
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        wan=$$(ip -o -4 addr show | awk '/10\.231\.1\./{print $$2}')
+        iptables -t nat -A POSTROUTING -s 10.231.3.0/24 -o "$$wan" -j MASQUERADE
+        echo "NAT 10.231.3.0/24 -> $$wan"; exec sleep infinity
+    networks:
+      wan: { ipv4_address: 10.231.1.30 }
+      lan: { ipv4_address: 10.231.3.2 }
+
+  nat-device-a: &nat-device
+    <<: *client
+    container_name: patina-e2e-nat-device-a
+    hostname: nat-device-a
+    profiles: [nat]
+    depends_on: [nat-router]
+    environment: &nat-env
+      <<: *client-env
+      RD_ROLE: device
+      RD_NET_MODE: ws
+      RD_FIREWALL: ws-only
+      RD_SERVER: rd.e2e.test
+      PROXY_IP: 10.231.1.10
+      RD_GATEWAY: 10.231.3.2
+      RD_BG: "#6a1b9a"
+    extra_hosts: ["rd.e2e.test:10.231.1.10"]
+    networks:
+      lan: { ipv4_address: 10.231.3.21 }
+
+  nat-device-b:
+    <<: *nat-device
+    container_name: patina-e2e-nat-device-b
+    hostname: nat-device-b
+    environment:
+      <<: *nat-env
+      RD_BG: "#ef6c00"
+    networks:
+      lan: { ipv4_address: 10.231.3.22 }
+
+  # --- Protocol probe (raw WS client) ---------------------------------------
+  probe:
+    image: ${PROBE_IMAGE:-patina-e2e-probe:latest}
+    profiles: [probe]
+    extra_hosts: ["rd.e2e.test:10.231.1.10"]
+    volumes:
+      - ${E2E_STATE}/certs/ca.crt:/ca/ca.crt:ro
+      - patina-e2e-hbbs-data:/hbbs-data:ro
+    networks:
+      wan: {}
+
+networks:
+  wan:
+    name: patina-e2e-wan
+    ipam: { config: [{ subnet: 10.231.1.0/24 }] }
+  ctl:
+    name: patina-e2e-ctl
+    ipam: { config: [{ subnet: 10.231.2.0/24 }] }
+  lan:
+    # Not `internal: true`: Docker drops forwarded traffic leaving an internal
+    # bridge, which would break the NAT router. The devices replace their
+    # default route with the router and their firewall still only allows
+    # tcp/443 to nginx.
+    name: patina-e2e-lan
+    ipam: { config: [{ subnet: 10.231.3.0/24 }] }
+
+  proxy:
+    name: patina-e2e-proxy
+    ipam: { config: [{ subnet: 10.231.4.0/24 }] }
+
+volumes:
+  patina-e2e-hbbs-data: { name: patina-e2e-hbbs-data }
+  patina-e2e-ws-device-home: { name: patina-e2e-ws-device-home }

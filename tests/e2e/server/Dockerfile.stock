@@ -1,0 +1,19 @@
+# Stock upstream hbbs/hbbr built from an exact source tree (no patches).
+# Context is produced by scripts/build-stock.sh from `git archive` of the
+# base commit plus the pinned hbb_common submodule, so local edits cannot leak in.
+FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked --bin hbbs --bin hbbr
+
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && useradd -u 1000 -m app \
+    && mkdir /data && chown 1000:1000 /data
+COPY --from=build /src/target/release/hbbs /src/target/release/hbbr /usr/local/bin/
+# Same runtime contract as the project Dockerfile: binary chosen by command,
+# state in /data owned by 1000:1000.
+USER 1000:1000
+WORKDIR /data
+VOLUME ["/data"]
+CMD ["hbbs"]

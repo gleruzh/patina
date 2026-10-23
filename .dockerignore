@@ -1,0 +1,25 @@
+# Keep the build context to what cargo needs: Cargo.*, build.rs, src/, libs/,
+# tests/, .cargo/, plus .env and db_v2.sqlite3 (sqlx compile-time checks).
+.git
+**/.git
+target
+**/target
+ui
+debian
+docker
+docker-classic
+kubernetes
+systemd
+rcd
+deploy
+docs
+.github
+.vscode
+.idea
+.claude
+.DS_Store
+Dockerfile
+.dockerignore
+# Never ship local key material or runtime databases other than the schema db.
+id_ed25519*
+db_v2.sqlite3-*

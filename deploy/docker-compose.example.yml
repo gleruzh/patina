@@ -1,0 +1,105 @@
+# Example: Patina hbbs + hbbr behind linuxserver SWAG, WebSocket devices on 443 only.
+#
+#   git submodule update --init libs/hbb_common
+#   docker build -t patina:local .            # add --platform linux/amd64 for x86_64 hosts
+#   cp deploy/swag/patina.subdomain.conf <swag config>/nginx/proxy-confs/
+#   docker compose -f deploy/docker-compose.example.yml up -d
+#
+# Replace patina.example.com and the image reference. For production, push the image to
+# a registry and pin it by digest (image: registry/patina:tag@sha256:...).
+# Clients: see deploy/client-settings.md.
+
+services:
+    swag:
+        image: lscr.io/linuxserver/swag
+        container_name: swag
+        cap_add:
+            - NET_ADMIN
+        environment:
+            - PUID=1000
+            - PGID=1000
+            - TZ=Etc/UTC
+            - URL=patina.example.com
+            - VALIDATION=http
+        volumes:
+            - ./swag:/config
+        ports:
+            - 80:80
+            - 443:443
+        networks:
+            public:
+            # swag reaches hbbs:21118 / hbbr:21119 here; they are not published.
+            # Fixed address: hbbs trusts proxy headers from this /32 only.
+            rustdesk-net:
+                ipv4_address: 172.30.21.10
+        restart: unless-stopped
+
+    hbbs:
+        container_name: rustdesk-hbbs
+        image: patina:local
+        # Bare domain: WebSocket clients derive wss://patina.example.com/ws/relay from it,
+        # other clients use patina.example.com:21117. It must resolve when hbbs starts.
+        command: hbbs -r patina.example.com
+        user: "1000:1000"
+        environment:
+            - WS_REGISTER=Y
+            # Only swag may set X-Real-IP / X-Real-Port. Trusting the whole subnet would let
+            # any other container on rustdesk-net spoof client addresses.
+            - TRUSTED_PROXY_CIDRS=172.30.21.10/32
+            # Fallback if swag cannot have a fixed address (weaker, see above):
+            # - TRUSTED_PROXY_CIDRS=172.30.21.0/24
+            - MAX_WS_PEERS=10000
+            - MAX_WS_CONN_PER_IP=64
+        ports:
+            - 21115:21115 # NAT type test
+            - 21116:21116 # TCP hole punching
+            - 21116:21116/udp # ID/Rendezvous server
+            # 21118 (WebSocket) is never published: reached only by swag on rustdesk-net.
+        volumes:
+            # id_ed25519 (0600), id_ed25519.pub, db_v2.sqlite3*. Must be writable by 1000:1000.
+            - ./rustdesk:/data
+        networks:
+            - rustdesk-net
+        depends_on:
+            - hbbr
+        cap_drop: [ALL]
+        security_opt: ["no-new-privileges:true"]
+        read_only: true
+        mem_limit: 256m
+        pids_limit: 64
+        logging:
+            driver: json-file
+            options: {max-size: "10m", max-file: "3"}
+        restart: unless-stopped
+
+    hbbr:
+        container_name: rustdesk-hbbr
+        image: patina:local
+        command: hbbr -k _
+        user: "1000:1000"
+        ports:
+            - 21117:21117 # Relay traffic
+            # 21119 (WebSocket relay) is never published: reached only by swag on rustdesk-net.
+        volumes:
+            - ./rustdesk:/data
+        networks:
+            - rustdesk-net
+        cap_drop: [ALL]
+        security_opt: ["no-new-privileges:true"]
+        read_only: true
+        mem_limit: 256m
+        pids_limit: 64
+        logging:
+            driver: json-file
+            options: {max-size: "10m", max-file: "3"}
+        restart: unless-stopped
+
+networks:
+    public:
+    rustdesk-net:
+        # Explicit subnet, required for swag's fixed ipv4_address. Dynamic addresses come
+        # from ip_range, so no other container can take 172.30.21.10.
+        ipam:
+            config:
+                - subnet: 172.30.21.0/24
+                  ip_range: 172.30.21.128/25

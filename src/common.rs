@@ -1,3 +1,6 @@
+// NOTICE: This file is part of rustdesk-server (AGPL-3.0) and was modified
+// by Patina contributors in 2026. See PATCHES.md for the list of changes.
+
 use clap::App;
 use hbb_common::{
     allow_err, anyhow::{Context, Result}, get_version_number, log, tokio, ResultType
@@ -425,7 +428,18 @@ pub async fn listen_signal() -> Result<()> {
 }
 
 
+/// Patina: the daily version check posts a device fingerprint to
+/// api.rustdesk.com, so it runs only with `SOFTWARE_UPDATE_CHECK=Y`.
+#[allow(dead_code)]
+pub(crate) fn software_update_check_enabled() -> bool {
+    get_arg("SOFTWARE_UPDATE_CHECK").eq_ignore_ascii_case("Y")
+}
+
 pub fn check_software_update() {
+    if !software_update_check_enabled() {
+        log::info!("SOFTWARE_UPDATE_CHECK=N, not contacting api.rustdesk.com");
+        return;
+    }
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
     std::thread::spawn(move || loop {
         std::thread::spawn(move || allow_err!(check_software_update_()));
@@ -728,5 +742,37 @@ mod tests {
         gen_sk(0).unwrap();
         assert_eq!(fs::read(path).unwrap(), contents);
         std::env::set_current_dir(directory.path().parent().unwrap()).unwrap();
+    }
+
+    // Patina: no call to api.rustdesk.com unless the operator opts in
+    #[test]
+    fn software_update_check_is_opt_in() {
+        let aliases = [
+            "SOFTWARE-UPDATE-CHECK",
+            "SOFTWARE_UPDATE_CHECK",
+            "software-update-check",
+            "software_update_check",
+        ];
+        for alias in aliases {
+            std::env::remove_var(alias);
+        }
+        assert!(!software_update_check_enabled(), "off by default");
+        for (value, enabled) in [
+            ("", false),
+            ("N", false),
+            ("no", false),
+            ("1", false),
+            ("yes", false),
+            ("y", true),
+            ("Y", true),
+        ] {
+            std::env::set_var("SOFTWARE_UPDATE_CHECK", value);
+            assert_eq!(software_update_check_enabled(), enabled, "{value:?}");
+        }
+        std::env::remove_var("SOFTWARE_UPDATE_CHECK");
+        // the switch also works in the `-c` file / `.env` spelling
+        std::env::set_var("SOFTWARE-UPDATE-CHECK", "Y");
+        assert!(software_update_check_enabled());
+        std::env::remove_var("SOFTWARE-UPDATE-CHECK");
     }
 }

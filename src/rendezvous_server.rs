@@ -1,5 +1,9 @@
+// NOTICE: This file is part of rustdesk-server (AGPL-3.0) and was modified
+// by Patina contributors in 2026. See PATCHES.md for the list of changes.
+
 use crate::common::*;
 use crate::peer::*;
+use crate::ws_peers::{self, Insert, Route, WsConn, WsPeers, WsSettings, WsTx};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -49,10 +53,10 @@ enum Data {
 
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
-type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
     TcpStream(TcpStreamSink),
-    Ws(WsSink),
+    // WebSocket connections are written by their own task, see ws_peers
+    Chan(WsTx),
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -107,6 +111,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    ws_peers: WsPeers,
 }
 
 enum LoopFailure {
@@ -169,7 +174,9 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            ws_peers: WsPeers::new(WsSettings::from_env()),
         };
+        rs.ws_peers.settings.log();
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
@@ -388,89 +395,9 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                    if let Some(res) = self.register_pk(rk, addr).await {
+                        return send_rk_res(socket, addr, res).await;
                     }
-                    let id = rk.id;
-                    let ip = addr.ip().to_string();
-                    if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
-                        }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
-                        }
-                    }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -519,6 +446,92 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// The RegisterPk checks, shared by UDP and WebSocket so both apply the
+    /// same id, IP-blocker, uuid/pk ownership and throttle rules. None means
+    /// the request is ignored without a reply.
+    async fn register_pk(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+    ) -> Option<register_pk_response::Result> {
+        if rk.uuid.is_empty() || rk.pk.is_empty() {
+            return None;
+        }
+        let id = rk.id;
+        let ip = addr.ip().to_string();
+        if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+            return Some(UUID_MISMATCH);
+        } else if !self.check_ip_blocker(&ip, &id).await {
+            return Some(TOO_FREQUENT);
+        }
+        let peer = self.pm.get_or(&id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == rk.uuid {
+                    if peer.info.ip != ip && peer.pk != rk.pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id,
+                            ip,
+                            rk.pk,
+                            peer.info.ip,
+                            peer.pk,
+                        );
+                        return Some(UUID_MISMATCH);
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id,
+                        rk.uuid,
+                        peer.uuid
+                    );
+                    return Some(UUID_MISMATCH);
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Some(TOO_FREQUENT);
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(&id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.clone(), 1);
+                } else if let Some(v) = ips.get_mut(&ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.clone(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.clone(),
+                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
+                );
+            }
+        }
+        if changed {
+            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        }
+        Some(register_pk_response::Result::OK)
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -527,6 +540,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        ws_conn: Option<&mut WsConn>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -544,11 +558,17 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        let id = rf.id.clone();
+                        if !self.ws_relay_allowed(&id, &rf.relay_server) {
+                            return true;
+                        }
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        if self.ws_peers.route(&id, &msg_out) == Route::NotWsPeer {
+                            let peer_addr = peer.read().await.socket_addr;
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
@@ -593,7 +613,10 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    if let Some(conn) = ws_conn {
+                        return self.handle_ws_register_pk(rk, addr, conn).await;
+                    }
                     let res = register_pk_response::Result::NOT_SUPPORT;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -602,10 +625,180 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
+                Some(rendezvous_message::Union::RegisterPeer(rp)) if ws_conn.is_some() => {
+                    if let Some(conn) = ws_conn {
+                        return self.handle_ws_register_peer(rp, conn).await;
+                    }
+                }
+                Some(rendezvous_message::Union::OnlineRequest(or)) if ws_conn.is_some() => {
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_online_response(OnlineResponse {
+                        states: self.online_states(&or.peers).await.into(),
+                        ..Default::default()
+                    });
+                    Self::send_to_sink(sink, msg_out).await;
+                }
                 _ => {}
             }
         }
         false
+    }
+
+    /// RegisterPk on a WebSocket connection (WS_REGISTER=Y). On OK the
+    /// connection becomes the route to the device and stays open. Returns
+    /// false to close the connection.
+    async fn handle_ws_register_pk(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        conn: &mut WsConn,
+    ) -> bool {
+        let id = rk.id.clone();
+        if let Some(bound) = conn.id.as_deref() {
+            if bound != id {
+                log::warn!(
+                    "WebSocket {} registered as {} and then asked for {}, closing",
+                    addr,
+                    bound,
+                    id
+                );
+                return false;
+            }
+            // newest wins: a superseded connection must not take the id back
+            if !self.ws_peers.is_owner(bound, conn.conn_id) {
+                log::info!(
+                    "WebSocket {} lost {} to a newer connection, closing",
+                    addr,
+                    bound
+                );
+                return false;
+            }
+        }
+        if !self.ws_peers.has_room_for(&id) {
+            log::warn!("MAX_WS_PEERS reached, refusing {} from {}", id, addr);
+            Self::send_ws_rk_res(conn, register_pk_response::Result::SERVER_ERROR, 0);
+            return false;
+        }
+        let res = match self.register_pk(rk, addr).await {
+            Some(res) => res,
+            None => return true,
+        };
+        if res != register_pk_response::Result::OK {
+            Self::send_ws_rk_res(conn, res, 0);
+            return true;
+        }
+        if self.ws_peers.insert(&id, conn.conn_id, conn.tx.clone()) == Insert::Full {
+            log::warn!("MAX_WS_PEERS reached, refusing {} from {}", id, addr);
+            Self::send_ws_rk_res(conn, register_pk_response::Result::SERVER_ERROR, 0);
+            return false;
+        }
+        if let Some(peer) = self.pm.get_in_memory(&id).await {
+            let mut peer = peer.write().await;
+            peer.socket_addr = addr;
+            peer.last_reg_time = Instant::now();
+        }
+        if conn.id.is_none() {
+            log::info!("WebSocket peer {} registered from {}", id, addr);
+        }
+        conn.id = Some(id);
+        conn.keepalive.store(true, Ordering::Relaxed);
+        let keep_alive = self.ws_peers.settings.client_keep_alive();
+        Self::send_ws_rk_res(conn, register_pk_response::Result::OK, keep_alive);
+        true
+    }
+
+    /// RegisterPeer on a WebSocket is only a refresh for the id this
+    /// connection already registered with RegisterPk; it never binds an id.
+    async fn handle_ws_register_peer(&mut self, rp: RegisterPeer, conn: &WsConn) -> bool {
+        let owned = conn.id.as_deref() == Some(rp.id.as_str())
+            && self.ws_peers.is_owner(&rp.id, conn.conn_id);
+        if owned {
+            self.touch_ws_peer(&rp.id).await;
+        }
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_peer_response(RegisterPeerResponse {
+            request_pk: !owned,
+            ..Default::default()
+        });
+        conn.tx.send_msg(&msg_out);
+        true
+    }
+
+    /// An empty frame from a registered WebSocket is the device's heartbeat
+    /// (the echo of our keepalive). Returns false if the connection lost its
+    /// id to a newer one.
+    async fn handle_ws_heartbeat(&mut self, conn: &WsConn) -> bool {
+        match conn.id.as_deref() {
+            Some(id) if self.ws_peers.is_owner(id, conn.conn_id) => {
+                self.touch_ws_peer(id).await;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn touch_ws_peer(&self, id: &str) {
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            peer.write().await.last_reg_time = Instant::now();
+        }
+    }
+
+    /// Reader exit: drop the route if this connection still owns it, and mark
+    /// the device offline at once instead of after REG_TIMEOUT.
+    async fn handle_ws_closed(&mut self, conn: &WsConn) {
+        let Some(id) = conn.id.as_deref() else {
+            return;
+        };
+        if !self.ws_peers.remove_if_owner(id, conn.conn_id) {
+            return;
+        }
+        log::info!("WebSocket peer {} disconnected", id);
+        if let Some(peer) = self.pm.get_in_memory(id).await {
+            let mut peer = peer.write().await;
+            // a newer connection may have registered meanwhile
+            if !self.ws_peers.contains(id) {
+                peer.last_reg_time = get_expired_time();
+            }
+        }
+    }
+
+    /// RequestRelay names its relay server itself and carries no licence key.
+    /// For a device on WebSocket only relays from -r are allowed (none if -r
+    /// is not set), so nobody can point the device at a host of their
+    /// choosing and learn its address. A WS device answers PunchHole with a
+    /// relay on its own and does not need RequestRelay.
+    fn ws_relay_allowed(&self, id: &str, relay_server: &str) -> bool {
+        if !self.ws_peers.contains(id) {
+            return true;
+        }
+        let host = |s: &str| {
+            let s = s.trim();
+            match s.rsplit_once(':') {
+                Some((h, p)) if !h.contains(':') && p.parse::<u16>().is_ok() => h.to_owned(),
+                _ => s.to_owned(),
+            }
+            .to_lowercase()
+        };
+        let wanted = host(relay_server);
+        let ok = !wanted.is_empty() && self.relay_servers0.iter().any(|r| host(r) == wanted);
+        if !ok {
+            log::warn!(
+                "RequestRelay for WebSocket peer {} names relay {:?}, not in relay-servers; dropped",
+                id,
+                relay_server
+            );
+        }
+        ok
+    }
+
+    fn send_ws_rk_res(conn: &WsConn, res: register_pk_response::Result, keep_alive: i32) {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: res.into(),
+            keep_alive,
+            ..Default::default()
+        });
+        conn.tx.send_msg(&msg_out);
     }
 
     #[inline]
@@ -827,6 +1020,19 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_online_response(OnlineResponse {
+            states: self.online_states(&peers).await.into(),
+            ..Default::default()
+        });
+        stream.send(&msg_out).await?;
+
+        Ok(())
+    }
+
+    // A device on WebSocket refreshes last_reg_time with every heartbeat and
+    // expires it when its connection closes, so the same test covers it.
+    async fn online_states(&self, peers: &[String]) -> BytesMut {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -839,15 +1045,7 @@ impl RendezvousServer {
                 }
             }
         }
-
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_online_response(OnlineResponse {
-            states: states.into(),
-            ..Default::default()
-        });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        states
     }
 
     #[inline]
@@ -866,8 +1064,8 @@ impl RendezvousServer {
                     Sink::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+                    Sink::Chan(tx) => {
+                        tx.send(bytes);
                     }
                 }
             }
@@ -893,9 +1091,13 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+            // PunchHole / FetchLocalAddr go down the device's WebSocket if it has one
+            if self.ws_peers.route(&id, &msg) == Route::NotWsPeer {
+                self.tx.send(Data::Msg(msg.into(), addr))?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1190,46 +1392,46 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let mut sink;
         if ws {
-            use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let callback = |req: &Request, response: Response| {
-                let headers = req.headers();
-                // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-                // client IP is preserved when the WebSocket port runs behind a
-                // reverse proxy (WSS). They are NOT validated: anyone who can reach
-                // this port directly can spoof an arbitrary IP, bypassing IP-based
-                // rate limiting / blocking and corrupting logged IPs. Do not expose
-                // the WebSocket port directly to untrusted networks; only the
-                // reverse proxy, which overwrites these headers, should be able to
-                // connect to it.
-                // https://github.com/rustdesk/rustdesk-server/issues/634
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
-                Ok(response)
-            };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let (ws_stream, client, mut conn, rx) =
+                ws_peers::accept(stream, addr, &self.ws_peers).await?;
+            addr = client;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+            ws_peers::spawn_writer(
+                a,
+                rx,
+                conn.keepalive.clone(),
+                self.ws_peers.settings.keepalive,
+            );
+            let register = self.ws_peers.settings.register;
+            sink = Some(Sink::Chan(conn.tx.clone()));
+            loop {
+                let msg = tokio::select! {
+                    msg = timeout(30_000, b.next()) => msg,
+                    // the writer stopped: send failed or a newer connection took the id
+                    _ = conn.tx.closed() => break,
+                };
+                let Ok(Some(Ok(msg))) = msg else {
+                    break;
+                };
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if register && bytes.is_empty() && conn.id.is_some() {
+                        if self.handle_ws_heartbeat(&conn).await {
+                            continue;
+                        }
+                        break;
+                    }
+                    let conn = if register { Some(&mut conn) } else { None };
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, conn).await {
                         break;
                     }
                 }
             }
+            self.handle_ws_closed(&conn).await;
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, None).await {
                     break;
                 }
             }
@@ -1430,8 +1632,12 @@ mod tests {
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
     }
 
+    // tests that make punch requests must not run beside punch_reqs_bounded
+    static PUNCH_TEST_LOCK: Lazy<TokioMutex<()>> = Lazy::new(|| TokioMutex::new(()));
+
     #[hbb_common::tokio::test]
     async fn punch_reqs_bounded() {
+        let _punch = PUNCH_TEST_LOCK.lock().await;
         let max = *PUNCH_REQ_MAX;
         // 31 ids keep every request just outside the 30-entry dedupe window;
         // one request at least, so MAX_PUNCH_REQUESTS=0 is exercised too
@@ -1450,5 +1656,421 @@ mod tests {
             assert_eq!(lock.front().unwrap().to_id, format!("peer{}", max % 31));
             assert_eq!(lock.back().unwrap().to_id, format!("peer{}", (max * 2 - 1) % 31));
         }
+    }
+
+    // ---- WebSocket registration (ws_peers) ----
+
+    use crate::ws_peers::{tests::settings as ws_settings, Out};
+    use hbb_common::tokio::sync::mpsc as tmpsc;
+
+    static DB_LOCK: Lazy<TokioMutex<u32>> = Lazy::new(|| TokioMutex::new(0));
+
+    async fn test_server(relay: &str) -> (RendezvousServer, Receiver, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = {
+            // PeerMap::new reads DB_URL from the environment
+            let _guard = DB_LOCK.lock().await;
+            std::env::set_var("DB_URL", dir.path().join("db.sqlite3"));
+            PeerMap::new().await.unwrap()
+        };
+        let (tx, rx) = mpsc::unbounded_channel::<Data>();
+        let mut rs = RendezvousServer {
+            tcp_punch: Default::default(),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+            }),
+            ws_peers: WsPeers::new(ws_settings()),
+        };
+        // set directly: parse_relay_servers drops names that do not resolve
+        let relays: Vec<String> = relay.split(',').filter(|r| !r.is_empty()).map(String::from).collect();
+        rs.relay_servers0 = Arc::new(relays);
+        rs.relay_servers = rs.relay_servers0.clone();
+        (rs, rx, dir)
+    }
+
+    fn register_pk(id: &str, uuid: &str, pk: &str) -> Vec<u8> {
+        let mut m = RendezvousMessage::new();
+        m.set_register_pk(RegisterPk {
+            id: id.to_owned(),
+            uuid: uuid.as_bytes().to_vec().into(),
+            pk: pk.as_bytes().to_vec().into(),
+            ..Default::default()
+        });
+        m.write_to_bytes().unwrap()
+    }
+
+    fn punch_request(id: &str) -> Vec<u8> {
+        let mut m = RendezvousMessage::new();
+        m.set_punch_hole_request(PunchHoleRequest {
+            id: id.to_owned(),
+            nat_type: NatType::SYMMETRIC.into(),
+            force_relay: true,
+            ..Default::default()
+        });
+        m.write_to_bytes().unwrap()
+    }
+
+    fn next_msg(rx: &mut tmpsc::Receiver<Out>) -> RendezvousMessage {
+        match rx.try_recv() {
+            Ok(Out::Frame(b)) => RendezvousMessage::parse_from_bytes(&b).unwrap(),
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    fn rk_result(m: &RendezvousMessage) -> register_pk_response::Result {
+        assert!(m.has_register_pk_response(), "{m:?}");
+        m.register_pk_response().result.enum_value().unwrap()
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// One WebSocket connection: sink + per-connection state + writer queue.
+    struct TestConn {
+        sink: Option<Sink>,
+        conn: WsConn,
+        rx: tmpsc::Receiver<Out>,
+        addr: SocketAddr,
+    }
+
+    impl TestConn {
+        fn new(rs: &RendezvousServer, addr: &str) -> Self {
+            let addr = sa(addr);
+            let (conn, rx) = WsConn::for_test(&rs.ws_peers, addr.ip());
+            Self {
+                sink: Some(Sink::Chan(conn.tx.clone())),
+                conn,
+                rx,
+                addr,
+            }
+        }
+
+        async fn send(&mut self, rs: &mut RendezvousServer, bytes: &[u8]) -> bool {
+            rs.handle_tcp(bytes, &mut self.sink, self.addr, "", true, Some(&mut self.conn))
+                .await
+        }
+    }
+
+    async fn is_online(rs: &RendezvousServer, id: &str) -> bool {
+        rs.online_states(&[id.to_owned()]).await[0] & 0x80 != 0
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_register_and_route_punch_hole() {
+        let _punch = PUNCH_TEST_LOCK.lock().await;
+        let (mut rs, mut udp_rx, _db) = test_server("relay.example.com").await;
+        let mut dev = TestConn::new(&rs, "203.0.113.1:40001");
+        assert!(dev.send(&mut rs, &register_pk("wsdev01", "u1", "pk1")).await);
+        let res = next_msg(&mut dev.rx);
+        assert_eq!(rk_result(&res), register_pk_response::Result::OK);
+        assert_eq!(res.register_pk_response().keep_alive, 36);
+        assert!(dev.conn.keepalive.load(Ordering::Relaxed));
+        assert_eq!(dev.conn.id.as_deref(), Some("wsdev01"));
+        assert!(is_online(&rs, "wsdev01").await);
+
+        // a controller asks for the WS device: PunchHole goes down the WebSocket
+        let mut ctl = TestConn::new(&rs, "198.51.100.2:50000");
+        assert!(ctl.send(&mut rs, &punch_request("wsdev01")).await);
+        let ph = next_msg(&mut dev.rx);
+        assert!(ph.has_punch_hole(), "{ph:?}");
+        assert_eq!(
+            AddrMangle::decode(&ph.punch_hole().socket_addr),
+            sa("198.51.100.2:50000")
+        );
+        assert_eq!(ph.punch_hole().relay_server, "relay.example.com");
+        assert!(udp_rx.try_recv().is_err(), "nothing may go out over UDP");
+        // the controller's sink waits in tcp_punch for the RelayResponse
+        assert!(rs.tcp_punch.lock().await.contains_key(&sa("198.51.100.2:50000")));
+
+        // same intranet: FetchLocalAddr goes down the WebSocket as well
+        let mut udp_ctl_sink: Option<Sink> = None;
+        rs.handle_tcp_punch_hole_request(
+            sa("203.0.113.1:1234"),
+            PunchHoleRequest {
+                id: "wsdev01".to_owned(),
+                ..Default::default()
+            },
+            "",
+            false,
+        )
+        .await
+        .unwrap();
+        let fla = next_msg(&mut dev.rx);
+        assert!(fla.has_fetch_local_addr(), "{fla:?}");
+        assert!(udp_rx.try_recv().is_err());
+        drop(udp_ctl_sink.take());
+
+        // RequestRelay goes down the WebSocket too
+        let mut m = RendezvousMessage::new();
+        m.set_request_relay(RequestRelay {
+            id: "wsdev01".to_owned(),
+            relay_server: "relay.example.com:21117".to_owned(),
+            uuid: "x".to_owned(),
+            ..Default::default()
+        });
+        let mut ctl2 = TestConn::new(&rs, "198.51.100.3:50000");
+        assert!(ctl2.send(&mut rs, &m.write_to_bytes().unwrap()).await);
+        assert!(next_msg(&mut dev.rx).has_request_relay());
+        assert!(udp_rx.try_recv().is_err());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn udp_target_still_goes_over_udp() {
+        let _punch = PUNCH_TEST_LOCK.lock().await;
+        let (mut rs, mut udp_rx, _db) = test_server("").await;
+        {
+            let peer = rs.pm.get_or("udpdev1").await;
+            let mut p = peer.write().await;
+            p.socket_addr = sa("192.0.2.10:21116");
+            p.uuid = Bytes::from_static(b"u");
+            p.pk = Bytes::from_static(b"pk");
+            p.last_reg_time = Instant::now();
+        }
+        let mut ctl = TestConn::new(&rs, "198.51.100.4:50000");
+        assert!(ctl.send(&mut rs, &punch_request("udpdev1")).await);
+        match udp_rx.try_recv() {
+            Ok(Data::Msg(m, addr)) => {
+                assert!(m.has_punch_hole());
+                assert_eq!(addr, sa("192.0.2.10:21116"));
+            }
+            _ => panic!("expected a UDP PunchHole"),
+        }
+        // unknown id: the controller gets ID_NOT_EXIST on its own socket
+        assert!(ctl.send(&mut rs, &punch_request("nobody1")).await);
+        assert!(udp_rx.try_recv().is_err());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_hijack_with_other_uuid_is_rejected() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut dev = TestConn::new(&rs, "203.0.113.11:40001");
+        assert!(dev.send(&mut rs, &register_pk("victim1", "uuid-a", "pk-a")).await);
+        assert_eq!(rk_result(&next_msg(&mut dev.rx)), register_pk_response::Result::OK);
+
+        // a second connection, other uuid, same id: UUID_MISMATCH as over UDP
+        let mut evil = TestConn::new(&rs, "198.51.100.66:40002");
+        assert!(evil.send(&mut rs, &register_pk("victim1", "uuid-b", "pk-b")).await);
+        assert_eq!(
+            rk_result(&next_msg(&mut evil.rx)),
+            register_pk_response::Result::UUID_MISMATCH
+        );
+        assert!(evil.conn.id.is_none());
+        assert!(!evil.conn.keepalive.load(Ordering::Relaxed));
+        assert!(rs.ws_peers.is_owner("victim1", dev.conn.conn_id));
+        assert!(dev.rx.try_recv().is_err(), "the owner is not disturbed");
+        let peer = rs.pm.get_in_memory("victim1").await.unwrap();
+        assert_eq!(&peer.read().await.uuid[..], b"uuid-a");
+        assert_eq!(peer.read().await.socket_addr, sa("203.0.113.11:40001"));
+
+        // RegisterPeer never binds an id to a connection
+        let mut m = RendezvousMessage::new();
+        m.set_register_peer(RegisterPeer {
+            id: "victim1".to_owned(),
+            ..Default::default()
+        });
+        assert!(evil.send(&mut rs, &m.write_to_bytes().unwrap()).await);
+        let r = next_msg(&mut evil.rx);
+        assert!(r.register_peer_response().request_pk);
+        assert!(evil.conn.id.is_none());
+        assert!(rs.ws_peers.is_owner("victim1", dev.conn.conn_id));
+        // and an empty frame from an unregistered connection refreshes nothing
+        assert!(!rs.handle_ws_heartbeat(&evil.conn).await);
+
+        // closing the rejected connection leaves the device online
+        rs.handle_ws_closed(&evil.conn).await;
+        assert!(rs.ws_peers.is_owner("victim1", dev.conn.conn_id));
+        assert!(is_online(&rs, "victim1").await);
+
+        // RegisterPeer from the owner is a refresh
+        assert!(dev.send(&mut rs, &m.write_to_bytes().unwrap()).await);
+        assert!(!next_msg(&mut dev.rx).register_peer_response().request_pk);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_reconnect_replaces_and_cleanup_is_owner_checked() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut c1 = TestConn::new(&rs, "203.0.113.21:40001");
+        assert!(c1.send(&mut rs, &register_pk("roam001", "u", "pk")).await);
+        assert_eq!(rk_result(&next_msg(&mut c1.rx)), register_pk_response::Result::OK);
+
+        let mut c2 = TestConn::new(&rs, "203.0.113.21:40002");
+        assert!(c2.send(&mut rs, &register_pk("roam001", "u", "pk")).await);
+        assert_eq!(rk_result(&next_msg(&mut c2.rx)), register_pk_response::Result::OK);
+        // the older connection is told to close and no longer owns the id
+        assert!(matches!(c1.rx.try_recv(), Ok(Out::Close)));
+        assert!(rs.ws_peers.is_owner("roam001", c2.conn.conn_id));
+        assert!(!rs.handle_ws_heartbeat(&c1.conn).await);
+        // nor can it take the id back before its reader notices the close
+        assert!(!c1.send(&mut rs, &register_pk("roam001", "u", "pk")).await);
+        assert!(c1.rx.try_recv().is_err());
+        assert!(rs.ws_peers.is_owner("roam001", c2.conn.conn_id));
+        assert!(c2.rx.try_recv().is_err(), "the new owner is not closed");
+        let peer = rs.pm.get_in_memory("roam001").await.unwrap();
+        assert_eq!(peer.read().await.socket_addr, sa("203.0.113.21:40002"));
+
+        // the old reader exiting must not take the new route down
+        rs.handle_ws_closed(&c1.conn).await;
+        assert!(rs.ws_peers.contains("roam001"));
+        assert!(is_online(&rs, "roam001").await);
+
+        // heartbeats keep the device online
+        peer.write().await.last_reg_time = get_expired_time();
+        assert!(!is_online(&rs, "roam001").await);
+        assert!(rs.handle_ws_heartbeat(&c2.conn).await);
+        assert!(is_online(&rs, "roam001").await);
+
+        // the owner going away removes the route and shows offline at once
+        rs.handle_ws_closed(&c2.conn).await;
+        assert!(!rs.ws_peers.contains("roam001"));
+        assert!(!is_online(&rs, "roam001").await);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_one_id_per_connection() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut c = TestConn::new(&rs, "203.0.113.31:40001");
+        assert!(c.send(&mut rs, &register_pk("first01", "u1", "pk1")).await);
+        assert_eq!(rk_result(&next_msg(&mut c.rx)), register_pk_response::Result::OK);
+        assert!(!c.send(&mut rs, &register_pk("second1", "u2", "pk2")).await);
+        assert!(!rs.ws_peers.contains("second1"));
+        assert!(rs.pm.get_in_memory("second1").await.is_none());
+
+        // before the first OK the id may change (the client regenerates its
+        // id after UUID_MISMATCH and retries on the same connection)
+        let mut d = TestConn::new(&rs, "203.0.113.32:40001");
+        assert!(d.send(&mut rs, &register_pk("first01", "other", "pk9")).await);
+        assert_eq!(
+            rk_result(&next_msg(&mut d.rx)),
+            register_pk_response::Result::UUID_MISMATCH
+        );
+        assert!(d.send(&mut rs, &register_pk("fresh01", "other", "pk9")).await);
+        assert_eq!(rk_result(&next_msg(&mut d.rx)), register_pk_response::Result::OK);
+        assert_eq!(d.conn.id.as_deref(), Some("fresh01"));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_register_checks_match_udp() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut c = TestConn::new(&rs, "203.0.113.41:40001");
+        // too short an id
+        assert!(c.send(&mut rs, &register_pk("abc", "u", "pk")).await);
+        assert_eq!(
+            rk_result(&next_msg(&mut c.rx)),
+            register_pk_response::Result::UUID_MISMATCH
+        );
+        // empty uuid: ignored without a reply, as over UDP
+        assert!(c.send(&mut rs, &register_pk("abcdef1", "", "pk")).await);
+        assert!(c.rx.try_recv().is_err());
+        assert!(c.conn.id.is_none());
+        // the reg_pk throttle: three in a row are fine, the fourth is not
+        for _ in 0..3 {
+            assert!(c.send(&mut rs, &register_pk("thrott1", "u", "pk")).await);
+            assert_eq!(rk_result(&next_msg(&mut c.rx)), register_pk_response::Result::OK);
+        }
+        assert!(c.send(&mut rs, &register_pk("thrott1", "u", "pk")).await);
+        assert_eq!(
+            rk_result(&next_msg(&mut c.rx)),
+            register_pk_response::Result::TOO_FREQUENT
+        );
+        // still registered, the throttle does not drop the route
+        assert!(rs.ws_peers.is_owner("thrott1", c.conn.conn_id));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_max_peers() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        // ws_settings() allows 3 peers and 2 connections per IP
+        for i in 0..3 {
+            let mut c = TestConn::new(&rs, &format!("203.0.113.5{i}:40001"));
+            assert!(c.send(&mut rs, &register_pk(&format!("full00{i}"), "u", "pk")).await);
+            assert_eq!(rk_result(&next_msg(&mut c.rx)), register_pk_response::Result::OK);
+            std::mem::forget(c); // keep the connection "open"
+        }
+        let mut c = TestConn::new(&rs, "203.0.113.59:40001");
+        assert!(!c.send(&mut rs, &register_pk("full009", "u", "pk")).await);
+        assert_eq!(
+            rk_result(&next_msg(&mut c.rx)),
+            register_pk_response::Result::SERVER_ERROR
+        );
+        assert!(rs.pm.get_in_memory("full009").await.is_none(), "no DB record either");
+        assert_eq!(rs.ws_peers.len(), 3);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_register_off_keeps_upstream_behaviour() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut c = TestConn::new(&rs, "203.0.113.61:40001");
+        // what handle_listener_inner passes with WS_REGISTER=N
+        assert!(
+            !rs.handle_tcp(&register_pk("plain01", "u", "pk"), &mut c.sink, c.addr, "", true, None)
+                .await
+        );
+        assert_eq!(
+            rk_result(&next_msg(&mut c.rx)),
+            register_pk_response::Result::NOT_SUPPORT
+        );
+        assert!(!rs.ws_peers.contains("plain01"));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_online_request() {
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut dev = TestConn::new(&rs, "203.0.113.71:40001");
+        assert!(dev.send(&mut rs, &register_pk("online1", "u", "pk")).await);
+        next_msg(&mut dev.rx);
+        let mut m = RendezvousMessage::new();
+        m.set_online_request(OnlineRequest {
+            id: "asker01".to_owned(),
+            peers: vec!["nobody9".to_owned(), "online1".to_owned()],
+            ..Default::default()
+        });
+        let mut q = TestConn::new(&rs, "198.51.100.71:40001");
+        // answered, then the connection closes as on 21115
+        assert!(!q.send(&mut rs, &m.write_to_bytes().unwrap()).await);
+        let r = next_msg(&mut q.rx);
+        assert_eq!(&r.online_response().states[..], &[0b0100_0000]);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn ws_request_relay_must_name_a_known_relay() {
+        let (mut rs, _udp_rx, _db) = test_server("rd.example.com").await;
+        let mut dev = TestConn::new(&rs, "203.0.113.81:40001");
+        assert!(dev.send(&mut rs, &register_pk("relay01", "u", "pk")).await);
+        next_msg(&mut dev.rx);
+        assert!(rs.ws_relay_allowed("relay01", "rd.example.com"));
+        assert!(rs.ws_relay_allowed("relay01", "RD.example.com:21117"));
+        assert!(!rs.ws_relay_allowed("relay01", ""));
+        assert!(!rs.ws_relay_allowed("relay01", "evil.example.net:21117"));
+        // UDP peers keep upstream's behaviour
+        assert!(rs.ws_relay_allowed("udponly", "evil.example.net"));
+
+        let mut m = RendezvousMessage::new();
+        m.set_request_relay(RequestRelay {
+            id: "relay01".to_owned(),
+            relay_server: "evil.example.net".to_owned(),
+            ..Default::default()
+        });
+        let mut ctl = TestConn::new(&rs, "198.51.100.81:40001");
+        assert!(ctl.send(&mut rs, &m.write_to_bytes().unwrap()).await);
+        assert!(dev.rx.try_recv().is_err(), "not forwarded");
+
+        // without -r there is nothing to check against: refused
+        let (mut rs, _udp_rx, _db) = test_server("").await;
+        let mut dev = TestConn::new(&rs, "203.0.113.82:40001");
+        assert!(dev.send(&mut rs, &register_pk("relay02", "u", "pk")).await);
+        next_msg(&mut dev.rx);
+        assert!(!rs.ws_relay_allowed("relay02", "rd.example.com"));
+        assert!(rs.ws_relay_allowed("udponly", "rd.example.com"));
     }
 }

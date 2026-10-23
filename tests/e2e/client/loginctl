@@ -1,0 +1,38 @@
+#!/bin/sh
+# Test-only stand-in for systemd-logind's loginctl (containers have no logind).
+# Reports one active local X11 session on seat0 for user rd (uid 1000), which
+# is what a logged-in Linux desktop looks like to the RustDesk client. The
+# client asks for this to fill PeerInfo.username; file transfer refuses to
+# start without it ("No active console user logged on").
+props() {
+    cat <<P
+Id=c1
+Name=rd
+User=1000
+Seat=seat0
+Display=:0
+TTY=tty7
+VTNr=7
+Remote=no
+Service=lightdm
+Type=x11
+Class=user
+Desktop=openbox
+State=active
+Active=yes
+Leader=1
+P
+}
+case "$1" in
+    ""|list-sessions)
+        echo "SESSION  UID USER SEAT  TTY"
+        echo "     c1 1000 rd   seat0 tty7"
+        echo
+        echo "1 sessions listed." ;;
+    show-session)
+        shift
+        if [ "$1" = "-p" ]; then props | grep "^$2="; else props; fi ;;
+    show-user)
+        echo "Name=rd"; echo "UID=1000"; echo "State=active"; echo "Sessions=c1"; echo "Display=c1" ;;
+    *) exit 0 ;;
+esac
