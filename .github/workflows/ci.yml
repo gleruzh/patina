@@ -1,0 +1,189 @@
+# CI: lint, build + test on native amd64 and arm64 runners (no QEMU), a secret scan of the pull
+# request's commits and a vulnerability scan of the built image. Nothing is published and no secret
+# is used. The trigger is pull_request (never pull_request_target), so code from other people's pull
+# requests runs with a read-only token and without access to secrets. master is protected (merge
+# only through a pull request with "CI result" green), so a weekly run keeps the Security tab current
+# for master instead of testing the same tree again after each merge.
+# Publishing is in publish.yml; see docs/ci.md.
+name: CI
+
+on:
+  pull_request:
+  schedule:
+    - cron: '23 5 * * 1'   # Mondays: a fresh Trivy scan of master for the Security tab
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Tool images, pinned by tag and manifest-list digest (docker buildx imagetools inspect <image>:<tag>).
+  TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+
+jobs:
+  lint:
+    name: Lint (actionlint, shellcheck, hadolint, pins, VERSION)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ci/lint.sh
+        run: ci/lint.sh
+
+  # The same job on a native runner of each architecture. The test suite is ci/test.sh (also used
+  # by upstream-watch.yml); the image is then built from the same tree and started.
+  test:
+    name: Build and test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+
+      - name: ci/test.sh (cargo test --locked)
+        run: ci/test.sh
+
+      - name: Build the image
+        run: docker build --platform "${{ matrix.platform }}" -t patina:ci .
+
+      - name: Start hbbs and hbbr from the image
+        run: |
+          for bin in hbbs hbbr; do
+            docker run --rm patina:ci "${bin}" --help >/dev/null
+            echo "${bin} --help: ok"
+          done
+
+      # Findings never fail the build (--exit-code 0): they are in base-image packages that this
+      # repository does not control, and Dependabot bumps the base image digests. A scanner that
+      # does not work does fail the step.
+      - name: Scan the image with Trivy
+        id: scan
+        run: |
+          docker save -o "${RUNNER_TEMP}/image.tar" patina:ci
+          docker run --rm -v "${RUNNER_TEMP}:/work" -v patina-ci-trivy:/root/.cache/trivy "${TRIVY_IMAGE}" \
+            image --quiet --scanners vuln --exit-code 0 --format json --output /work/trivy.json --input /work/image.tar
+          jq -e '.ArtifactName' "${RUNNER_TEMP}/trivy.json" > /dev/null \
+            || { echo "::error title=Trivy::the report is missing or not JSON: the scan did not work"; exit 1; }
+          docker run --rm -v "${RUNNER_TEMP}:/work" -v patina-ci-trivy:/root/.cache/trivy "${TRIVY_IMAGE}" \
+            convert --format table /work/trivy.json
+          docker run --rm -v "${RUNNER_TEMP}:/work" -v patina-ci-trivy:/root/.cache/trivy "${TRIVY_IMAGE}" \
+            convert --format sarif --output /work/trivy.sarif /work/trivy.json
+          {
+            echo "### Vulnerability scan (Trivy, ${{ matrix.platform }}), reported only"
+            echo
+            jq -r '[.Results[]?.Vulnerabilities[]?.Severity] | length as $n | group_by(.)
+              | map("\(.[0]): \(length)") | "Findings: \($n) (" + join(", ") + "). Details are in the log of the scan step."' \
+              "${RUNNER_TEMP}/trivy.json"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Keep the SARIF report
+        if: ${{ !cancelled() && steps.scan.outcome == 'success' && github.event_name == 'schedule' && matrix.arch == 'amd64' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-sarif
+          path: ${{ runner.temp }}/trivy.sarif
+          retention-days: 14
+
+  # Secrets in the commits of the pull request (the whole history on a scheduled or manual run).
+  # gitleaks runs as a pinned container: no licence key and no third-party action with a token.
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: gitleaks git
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          opts=()
+          if [[ -n "${BASE_SHA}" ]]; then
+            echo "Scanning the commits ${BASE_SHA}..${HEAD_SHA}"
+            opts+=(--log-opts="${BASE_SHA}..${HEAD_SHA}")
+          else
+            echo "Scanning the whole history"
+          fi
+          # safe.directory: the mounted repository belongs to another user than root in the container.
+          docker run --rm -v "${PWD}:/repo:ro" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/repo \
+            "${GITLEAKS_IMAGE}" git /repo "${opts[@]}" --redact --no-banner --verbose
+
+  # The one check that the branch protection of master requires, by this name: it passes only when
+  # every job above passed (a skipped job would count as passed, so this one always runs).
+  ci-result:
+    name: CI result
+    needs: [lint, test, gitleaks]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "lint, test, gitleaks: ${RESULTS}"
+          for r in ${RESULTS}; do [[ "${r}" == success ]] || exit 1; done
+
+  # A separate job, so that the job running the pull request's code never holds
+  # security-events: write. Scheduled runs only: pull requests (from forks too) get no upload.
+  # Code scanning is free for public repositories.
+  security-tab:
+    name: Upload the scan to the Security tab
+    needs: test
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # upload-sarif reads the commit from the checkout; no code from it is run here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the SARIF report
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: trivy-sarif
+          path: ${{ runner.temp }}/sarif
+      - name: Upload to code scanning
+        if: steps.download.outcome == 'success'
+        uses: github/codeql-action/upload-sarif@8498dc4c2b27cdd99baf0f87955b29ebbf30c78d # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy.sarif
+          category: trivy-image

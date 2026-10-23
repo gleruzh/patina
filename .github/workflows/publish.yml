@@ -1,0 +1,382 @@
+# Publish: build the image natively on an amd64 and an arm64 runner (no QEMU), push each to GHCR by
+# digest only, smoke-test the pushed digest on the runner that built it, and only then merge the two
+# into one multi-arch manifest list (linux/amd64 + linux/arm64) and give it its tags. The merged
+# digest is signed with cosign (keyless) and attested (SLSA build provenance); BuildKit also attaches
+# an SBOM and provenance to each image. A tag vX.Y.Z (equal to VERSION) also creates a GitHub Release.
+# Works unchanged in any fork: the image is ghcr.io/<repository owner, lowercase>/patina.
+#
+# Trust boundaries: this workflow runs only from master or from a v*.*.* tag that is on master, never
+# for a pull request, and uses no secret except the job's own GITHUB_TOKEN. Write permissions are
+# granted per job: packages (GHCR push), id-token (keyless signing), attestations, contents (release).
+# See docs/ci.md.
+name: Publish
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - src/**
+      - libs/**
+      - Cargo.*
+      - build.rs
+      - Dockerfile
+      - .dockerignore
+      - VERSION
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time per ref, never cancelled halfway: two runs of master do not move the edge tag at
+# the same time, and a tag is not displaced by a push to master that is waiting (GitHub keeps one
+# waiting run per group).
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Version, refs and upstream base
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      image: ${{ steps.plan.outputs.image }}
+      created: ${{ steps.plan.outputs.created }}
+      upstream_repo: ${{ steps.plan.outputs.upstream_repo }}
+      upstream_commit: ${{ steps.plan.outputs.upstream_commit }}
+      hbb_common: ${{ steps.plan.outputs.hbb_common }}
+      is_tag: ${{ steps.plan.outputs.is_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Plan
+        id: plan
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # Only master and release tags publish; a manual run could pick any branch.
+          is_tag=false
+          case "${GITHUB_REF}" in
+            refs/heads/master) ;;
+            refs/tags/v*.*.*) is_tag=true ;;
+            *) echo "::error::Publish runs only from master or a vX.Y.Z tag, not from ${GITHUB_REF}."; exit 1 ;;
+          esac
+
+          version="$(cat VERSION)"
+          [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "::error::VERSION must be X.Y.Z, got '${version}'."; exit 1; }
+          if [[ "${is_tag}" == true ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+              echo "::error::The tag ${GITHUB_REF_NAME} is not v${version} (VERSION). Bump VERSION on master first, then tag."
+              exit 1
+            fi
+            # A release tag must be a commit of master (the branch protection does not cover tags).
+            git fetch --no-tags origin master:refs/remotes/origin/master
+            git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/master \
+              || { echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on master."; exit 1; }
+          fi
+
+          # UPSTREAM: repo=... / commit=... (the rustdesk-server commit this tree is based on)
+          upstream_repo="$(sed -n 's/^repo=//p' UPSTREAM)"
+          upstream_commit="$(sed -n 's/^commit=//p' UPSTREAM)"
+          [[ "${upstream_repo}" == https://* && "${upstream_commit}" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::UPSTREAM needs repo=https://... and commit=<40 hex>."; exit 1; }
+          hbb_common="$(git ls-tree HEAD libs/hbb_common | awk '{print $3}')"
+          [[ "${hbb_common}" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::libs/hbb_common is not a submodule commit in HEAD."; exit 1; }
+
+          {
+            echo "version=${version}"
+            echo "image=ghcr.io/${OWNER,,}/patina"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "upstream_repo=${upstream_repo}"
+            echo "upstream_commit=${upstream_commit}"
+            echo "hbb_common=${hbb_common}"
+            echo "is_tag=${is_tag}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Patina ${version} (${GITHUB_REF_NAME}) on rustdesk-server ${upstream_commit}, hbb_common ${hbb_common}"
+
+  # One job per architecture, each on a native runner.
+  build:
+    name: Build and smoke-test (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write       # push to GHCR
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+
+      - name: Set up Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only: nothing points at this image until it has passed the smoke test and
+      # the merge job has tagged it. The labels end up in the image config; the Dockerfile has no
+      # ARGs for them.
+      - name: Build and push to GHCR by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          platforms: ${{ matrix.platform }}
+          pull: true
+          labels: |
+            org.opencontainers.image.title=patina
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.created=${{ needs.prepare.outputs.created }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            io.patina.upstream.repo=${{ needs.prepare.outputs.upstream_repo }}
+            io.patina.upstream.commit=${{ needs.prepare.outputs.upstream_commit }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=patina-${{ matrix.arch }}
+          cache-to: type=gha,scope=patina-${{ matrix.arch }},mode=max
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      # The digest as GHCR serves it, on the architecture that built it: the container starts and
+      # both binaries run.
+      - name: Smoke test the pushed digest
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull --platform "${{ matrix.platform }}" "${REF}"
+          for bin in hbbs hbbr; do
+            docker run --rm "${REF}" "${bin}" --help >/dev/null
+            echo "${bin} --help: exit 0"
+          done
+          for bin in hbbs hbbr; do
+            name="patina-smoke-${bin}"
+            docker run -d --name "${name}" "${REF}" "${bin}" >/dev/null
+            sleep 5
+            running="$(docker inspect -f '{{.State.Running}}' "${name}")"
+            docker logs "${name}" 2>&1 | tail -n 5
+            docker rm -f "${name}" >/dev/null
+            [[ "${running}" == true ]] || { echo "::error::${bin} did not stay running"; exit 1; }
+            echo "${bin}: started and stayed up"
+          done
+
+      - name: Keep the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+      - name: Upload the digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge, tag, sign and attest
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write       # tag the manifest list in GHCR
+      id-token: write       # keyless signing (cosign) and the provenance attestation
+      attestations: write   # store the provenance attestation in GitHub
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # master push: edge, sha-<short>. Tag vX.Y.Z: X.Y.Z, X.Y, latest, sha-<short>.
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Merge into a manifest list (linux/amd64 + linux/arm64)
+        id: merge
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          UPSTREAM_REPO: ${{ needs.prepare.outputs.upstream_repo }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_commit }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          files=(*)
+          [[ "${#files[@]}" -eq 2 ]] || { echo "::error::expected 2 digests (amd64, arm64), got: ${files[*]}"; exit 1; }
+          args=()
+          while IFS= read -r tag; do [[ -n "${tag}" ]] && args+=(--tag "${tag}"); done <<<"${TAGS}"
+          args+=(
+            --annotation "index:org.opencontainers.image.title=patina"
+            --annotation "index:org.opencontainers.image.source=${SOURCE}"
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}"
+            --annotation "index:org.opencontainers.image.version=${VERSION}"
+            --annotation "index:org.opencontainers.image.licenses=AGPL-3.0-only"
+            --annotation "index:io.patina.upstream.repo=${UPSTREAM_REPO}"
+            --annotation "index:io.patina.upstream.commit=${UPSTREAM_COMMIT}"
+          )
+          # shellcheck disable=SC2046 # one image@sha256:... argument per digest file
+          docker buildx imagetools create "${args[@]}" $(printf "${IMAGE}@sha256:%s " "${files[@]}")
+
+          first="$(head -n 1 <<<"${TAGS}")"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${first}" | jq -r .digest)"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "Merged ${first} = ${digest}"
+
+          # Every tag has that digest, and the list holds exactly the two platforms (the
+          # unknown/unknown entries are BuildKit's SBOM and provenance attestations).
+          while IFS= read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            got="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${tag}" | jq -r .digest)"
+            [[ "${got}" == "${digest}" ]] || { echo "::error::${tag} is ${got}, not ${digest}"; exit 1; }
+            echo "ok   ${tag}"
+          done <<<"${TAGS}"
+          platforms="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${IMAGE}@${digest}" \
+            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(",")')"
+          [[ "${platforms}" == linux/amd64,linux/arm64 ]] \
+            || { echo "::error::platforms are '${platforms}', expected linux/amd64,linux/arm64"; exit 1; }
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: the identity is this workflow run, recorded in the public Sigstore log.
+      - name: Sign the digest
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify the signature
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          REPO: ${{ github.repository }}
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/publish\\.yml@refs/(heads/master|tags/v[0-9]+\\.[0-9]+\\.[0-9]+)\$" \
+            "${IMAGE}@${DIGEST}" >/dev/null
+          echo "cosign verify: ok"
+
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Published ${IMAGE}@${DIGEST}"
+            echo
+            echo "Patina ${VERSION}, linux/amd64 + linux/arm64. Tags:"
+            echo
+            while IFS= read -r tag; do [[ -z "${tag}" ]] || printf -- "- \`%s\`\n" "${tag}"; done <<<"${TAGS}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # Tags only. The only job with contents: write.
+  release:
+    name: GitHub Release
+    needs: [prepare, merge]
+    if: ${{ needs.prepare.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          UPSTREAM_REPO: ${{ needs.prepare.outputs.upstream_repo }}
+          UPSTREAM_COMMIT: ${{ needs.prepare.outputs.upstream_commit }}
+          HBB_COMMON: ${{ needs.prepare.outputs.hbb_common }}
+        run: |
+          cat > "${RUNNER_TEMP}/notes.md" <<NOTES
+          Patina ${VERSION}
+
+          Based on rustdesk-server ${UPSTREAM_COMMIT}, hbb_common ${HBB_COMMON}.
+          Upstream: ${UPSTREAM_REPO}
+
+          Image: \`${IMAGE}@${DIGEST}\` (linux/amd64, linux/arm64)
+
+          \`\`\`
+          docker pull ${IMAGE}:${VERSION}
+          \`\`\`
+
+          The digest is signed with cosign (keyless) and carries a build provenance attestation:
+
+          \`\`\`
+          gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}
+          \`\`\`
+          NOTES
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --title "Patina ${VERSION}" --notes-file "${RUNNER_TEMP}/notes.md"
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --title "Patina ${VERSION}" --notes-file "${RUNNER_TEMP}/notes.md"
+          fi

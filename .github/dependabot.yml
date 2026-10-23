@@ -1,0 +1,28 @@
+# Dependabot proposes updates as pull requests; nothing is bumped silently. It keeps current:
+# - the GitHub Actions pinned by commit SHA in .github/workflows (the version comment is updated too);
+# - the base images in the Dockerfile (ARG RUST_IMAGE / RUNTIME_IMAGE), pinned by tag and digest.
+#   The runtime image is distroless, so a bumped digest is also how OS security fixes reach the
+#   published image; publish.yml republishes when the Dockerfile changes.
+#
+# There is deliberately NO cargo ecosystem here. Cargo.toml / Cargo.lock follow upstream
+# (rustdesk-server) and are replaced by every upstream merge; Dependabot bumps would conflict on
+# each one. Dependency updates arrive through the upstream sync instead.
+# The tool images pinned in ci/lint.sh and ci.yml are bumped by hand (see docs/ci.md).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
