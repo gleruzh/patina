@@ -1,0 +1,159 @@
+# Upstream watch: once a day, compare the master branch of rustdesk/rustdesk-server with the commit
+# recorded in the file UPSTREAM. When master has moved, merge it on a throwaway branch (trial only),
+# run ci/test.sh when the merge is clean, and open ONE issue per upstream master commit with the
+# new commits (security-looking ones marked), new tags, the hbb_common pin change and the merge and
+# test result. Older open upstream issues are closed with a pointer to the new one. Upstream master
+# is tracked, not only its tags, because upstream fixes can sit on master for months.
+# Once a week (Mondays, UTC, and on manual runs) it also checks that the hbb_common commit pinned
+# here and the commit in UPSTREAM can still be fetched from upstream, and opens an issue when not:
+# the AGPL requires the corresponding source to stay available, so a maintainer must publish a backup.
+#
+# No pull request is opened and nothing is pushed, by design: integration is done in the
+# development repository and synced to master through a reviewed pull request (one-way flow).
+#
+# Trust boundary: upstream code is merged and run (ci/test.sh) only in the job "trial", with a
+# read-only token and no secrets, and nothing is pushed from there. The job "report" holds the only
+# write permission (issues); it starts from a clean checkout, never builds or runs upstream code,
+# and treats what "trial" produced (commit messages, file names, the log) as untrusted data: values
+# are validated or cut to a length limit and everything free-form goes into code blocks.
+#
+# GitHub limitations:
+# - GitHub disables scheduled workflows after 60 days without repository activity (a commit, not
+#   only runs), and they do not run in a fork until Actions is enabled there. Re-enable the
+#   workflow in the Actions tab; a manual run (workflow_dispatch) always works.
+# - Logic is in ci/upstream-check.sh; DRY_RUN=1 ci/upstream-check.sh report prints instead of
+#   calling the issues API.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Report the current upstream master commit again even if an issue for it exists.
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Check upstream master
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read   # look for an existing issue for the commit
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      run_trial: ${{ steps.check.outputs.run_trial }}
+      weekly: ${{ steps.check.outputs.weekly }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare upstream master with UPSTREAM
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: ci/upstream-check.sh check
+
+  # Runs upstream code: read-only token, no secrets, nothing pushed.
+  trial:
+    name: Trial merge and tests
+    needs: check
+    if: needs.check.outputs.run_trial == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge upstream master and run ci/test.sh
+        env:
+          TARGET_SHA: ${{ needs.check.outputs.sha }}
+          OUT: ${{ runner.temp }}/upstream-trial
+        run: ci/upstream-check.sh trial
+
+      - name: Keep the result
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-watch-trial
+          path: ${{ runner.temp }}/upstream-trial
+          retention-days: 7
+          if-no-files-found: ignore
+
+  availability:
+    name: Pinned sources still available
+    needs: check
+    if: needs.check.outputs.weekly == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pinned commits from upstream
+        env:
+          OUT: ${{ runner.temp }}/upstream-availability
+        run: ci/upstream-check.sh availability
+
+      - name: Keep the result
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-watch-availability
+          path: ${{ runner.temp }}/upstream-availability
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The only job with a write permission. Never builds or runs upstream code.
+  report:
+    name: Open and close issues
+    needs: [check, trial, availability]
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.trial.result == 'success' || needs.availability.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read   # check out this repository's own script
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Get the results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: upstream-watch-*
+          path: ${{ runner.temp }}/in
+
+      - name: Open the issue, close older ones
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN: ${{ runner.temp }}/in
+          FORCE: ${{ inputs.force }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: ci/upstream-check.sh report
