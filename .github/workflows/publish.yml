@@ -166,8 +166,9 @@ jobs:
             io.patina.upstream.commit=${{ needs.prepare.outputs.upstream_commit }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=patina-${{ matrix.arch }}
-          cache-to: type=gha,scope=patina-${{ matrix.arch }},mode=max
+          # No Actions cache (type=gha) on purpose: upstream-watch.yml builds and runs untrusted
+          # upstream code on the default branch, and code in a job can write to that cache. A
+          # release must not reuse layers it may have poisoned, so every publish builds from scratch.
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       # The digest as GHCR serves it, on the architecture that built it: the container starts and
