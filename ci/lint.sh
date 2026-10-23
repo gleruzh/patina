@@ -2,8 +2,9 @@
 #
 # ci/lint.sh: static checks for what this repository owns in CI: actionlint (which also checks
 # the run: blocks of the workflows with shellcheck), the scripts in ci/, hadolint for the
-# Dockerfile, that every "uses:" is pinned to a full commit SHA with a version comment, and that
-# VERSION is a semantic version. Each linter runs from PATH if installed, else as the pinned
+# Dockerfile, the publish.yml invariants (on request only, no cache, no Docker Hub token in env or
+# run:), the Docker Hub page limits, that every "uses:" is pinned to a full commit SHA with a version
+# comment, and that VERSION is a semantic version. Each linter runs from PATH if installed, else as the pinned
 # container below, so the result does not depend on the host. Exit code 0 means clean.
 #
 # The pins are tag and manifest-list digest. To bump one:
@@ -60,6 +61,43 @@ while IFS= read -r hit; do
         *) fail "no @ref: ${hit}" ;;
     esac
 done < <(grep -rnE '^[[:space:]-]*uses:' .github/workflows .github/actions 2>/dev/null || true)
+
+# publish.yml publishes on request only, never uses the Actions cache, never cancels a run halfway,
+# and keeps the Docker Hub token out of env: and run: (it may only be an input of an action).
+echo "publish.yml invariants"
+wf=.github/workflows/publish.yml
+if grep -nE '^[[:space:]]+(branches|branches-ignore|paths|paths-ignore|schedule|pull_request|pull_request_target|workflow_run):' "${wf}"; then
+    fail "${wf}: publishing is on request only (tag or workflow_dispatch), no other trigger"
+fi
+if grep -nE 'cache-(from|to):|type=gha' "${wf}" | grep -vE '^[0-9]+:[[:space:]]*#'; then
+    fail "${wf}: no Actions cache in a publish"
+fi
+if grep -n 'cancel-in-progress: true' "${wf}"; then fail "${wf}: a publish must never be cancelled halfway"; fi
+if grep -nE '^[[:space:]]+[A-Za-z_]+:[[:space:]]*\$\{\{[[:space:]]*secrets\.DOCKERHUB_TOKEN' "${wf}" | grep -vE '^[0-9]+:[[:space:]]+password:'; then
+    fail "${wf}: DOCKERHUB_TOKEN may only be the password: input of an action"
+fi
+if grep -nE '^[[:space:]]+[A-Z_]+:[[:space:]]*\$\{\{[[:space:]]*secrets\.DOCKERHUB_(USERNAME|TOKEN)[[:space:]]*\}\}' "${wf}" \
+    | grep -vE 'DOCKERHUB_USER: '; then
+    fail "${wf}: a Docker Hub secret in a step's env (only DOCKERHUB_USER for the repository name is allowed)"
+fi
+# Inside a run: block (lines indented deeper than the run: key) no ${{ secrets.* }}.
+if awk '
+    /^[[:space:]]*(- )?run:/ { match($0, /^[[:space:]]*/); base = RLENGTH; inrun = 1; next }
+    inrun { match($0, /^[[:space:]]*/); if ($0 !~ /^[[:space:]]*$/ && RLENGTH <= base) inrun = 0 }
+    inrun && /\$\{\{[^}]*secrets\./ { print FILENAME ":" NR ": " $0; found = 1 }
+    END { exit !found }
+' "${wf}"; then
+    fail "${wf}: a secret interpolated into a run: script; pass it through env"
+fi
+
+# The Docker Hub page: at most 25,000 bytes (a longer one is cut silently), the short description at
+# most 100 characters, and the cosign identity it shows is the one publish.yml verifies.
+echo "docs/dockerhub.md limits"
+[[ "$(wc -c < docs/dockerhub.md)" -le 25000 ]] || fail "docs/dockerhub.md is over 25,000 bytes"
+short="$(sed -n 's/^[[:space:]]*short-description:[[:space:]]*//p' "${wf}")"
+[[ -n "${short}" && "${#short}" -le 100 ]] || fail "short-description missing or over 100 characters (${#short})"
+grep -qF 'publish\.yml@refs/(heads/master|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' docs/dockerhub.md \
+    || fail "docs/dockerhub.md: cosign identity regexp differs from publish.yml"
 
 echo "VERSION is a semantic version"
 version="$(cat VERSION 2>/dev/null || true)"

@@ -3,12 +3,16 @@
 # into one multi-arch manifest list (linux/amd64 + linux/arm64) and give it its tags. The merged
 # digest is signed with cosign (keyless) and attested (SLSA build provenance); BuildKit also attaches
 # an SBOM and provenance to each image. A tag vX.Y.Z (equal to VERSION) also creates a GitHub Release.
+# When the secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are set, the same digest (not a rebuild) is
+# then copied to Docker Hub with the same tags, signed there, and the Docker Hub description is
+# replaced with docs/dockerhub.md. Without them those jobs are skipped with a notice.
 # Works unchanged in any fork: the image is ghcr.io/<repository owner, lowercase>/patina.
 #
 # Trust boundaries: this workflow runs only from master or from a v*.*.* tag that is on master, never
-# for a pull request, and uses no secret except the job's own GITHUB_TOKEN. Write permissions are
-# granted per job: packages (GHCR push), id-token (keyless signing), attestations, contents (release).
-# See docs/ci.md.
+# for a pull request. The only secrets besides the job's own GITHUB_TOKEN are the two Docker Hub
+# ones, which only the two Docker Hub jobs (and a boolean "are they set" in prepare) can see. Write
+# permissions are granted per job: packages (GHCR push), id-token (keyless signing), attestations,
+# contents (release). See docs/ci.md.
 name: Publish
 
 # Only on request: pushing a vX.Y.Z tag (release) or "Run workflow" (on master: edge build).
@@ -45,6 +49,7 @@ jobs:
       upstream_commit: ${{ steps.plan.outputs.upstream_commit }}
       hbb_common: ${{ steps.plan.outputs.hbb_common }}
       is_tag: ${{ steps.plan.outputs.is_tag }}
+      dockerhub: ${{ steps.plan.outputs.dockerhub }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,6 +60,8 @@ jobs:
         id: plan
         env:
           OWNER: ${{ github.repository_owner }}
+          # A boolean, not the secrets: the value of a secret never reaches this job's outputs.
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           # Only master and release tags publish; a manual run could pick any branch.
           is_tag=false
@@ -96,6 +103,15 @@ jobs:
             echo "hbb_common=${hbb_common}"
             echo "is_tag=${is_tag}"
           } >> "${GITHUB_OUTPUT}"
+
+          # Docker Hub is optional and enabled by its secrets; missing secrets are not an error.
+          if [[ "${HAS_DOCKERHUB}" == true ]]; then
+            echo "dockerhub=true" >> "${GITHUB_OUTPUT}"
+            echo "Docker Hub: enabled"
+          else
+            echo "dockerhub=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice title=Docker Hub skipped::Secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are not both set; not publishing to Docker Hub."
+          fi
           echo "Patina ${version} (${GITHUB_REF_NAME}) on rustdesk-server ${upstream_commit}, hbb_common ${hbb_common}"
 
   # One job per architecture, each on a native runner.
@@ -211,6 +227,10 @@ jobs:
       attestations: write   # store the provenance attestation in GitHub
     outputs:
       digest: ${{ steps.merge.outputs.digest }}
+      # Tag names only (edge, 0.1.0, ...), not image references: the Docker Hub job builds its own
+      # references, and GitHub drops a job output that contains a secret's value (the GHCR path
+      # contains the owner, who is often the Docker Hub user too).
+      tag_names: ${{ steps.names.outputs.tag_names }}
     env:
       IMAGE: ${{ needs.prepare.outputs.image }}
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -289,6 +309,15 @@ jobs:
           [[ "${platforms}" == linux/amd64,linux/arm64 ]] \
             || { echo "::error::platforms are '${platforms}', expected linux/amd64,linux/arm64"; exit 1; }
 
+      - name: Tag names for the other registries
+        id: names
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          names=()
+          while IFS= read -r tag; do [[ -n "${tag}" ]] && names+=("${tag##*:}"); done <<<"${TAGS}"
+          echo "tag_names=${names[*]}" >> "${GITHUB_OUTPUT}"
+
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -328,6 +357,134 @@ jobs:
             echo
             while IFS= read -r tag; do [[ -z "${tag}" ]] || printf -- "- \`%s\`\n" "${tag}"; done <<<"${TAGS}"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+  # Optional. Copies the manifest list that was tested, merged and signed in GHCR, by digest, so Docker
+  # Hub serves the identical digest (a rebuild would produce a different one). The only job (with
+  # dockerhub-description) that sees the Docker Hub secrets.
+  dockerhub:
+    name: Copy to Docker Hub
+    needs: [prepare, merge]
+    if: ${{ needs.prepare.outputs.dockerhub == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read        # read the digest from GHCR (the package may still be private)
+      id-token: write       # keyless signing (cosign) of the Docker Hub reference
+    env:
+      GHCR_IMAGE: ${{ needs.prepare.outputs.image }}
+      DIGEST: ${{ needs.merge.outputs.digest }}
+      TAG_NAMES: ${{ needs.merge.outputs.tag_names }}
+    outputs:
+      repository: ${{ steps.names.outputs.repository }}
+    steps:
+      # The default is <Docker Hub user>/patina; the variable DOCKERHUB_IMAGE (without docker.io/)
+      # overrides it when the repository is named differently. The user name is not confidential and
+      # is passed through env; the token is only ever an input of the login step.
+      - name: Image name on Docker Hub
+        id: names
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          VAR_DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        run: |
+          user="${DOCKERHUB_USER,,}"
+          repository="${VAR_DOCKERHUB_IMAGE:-${user}/patina}"
+          repository="${repository#docker.io/}"
+          [[ "${repository}" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] \
+            || { echo "::error::Docker Hub repository '${repository}' is not <namespace>/<name> (lowercase)."; exit 1; }
+          echo "DOCKERHUB_IMAGE=docker.io/${repository}" >> "${GITHUB_ENV}"
+          echo "repository=${repository}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # imagetools create copies the index as it is, so every tag gets the digest that was merged.
+      - name: Copy the digest to Docker Hub, with the same tags
+        run: |
+          args=()
+          for tag in ${TAG_NAMES}; do args+=(--tag "${DOCKERHUB_IMAGE}:${tag}"); done
+          [[ "${#args[@]}" -gt 0 ]] || { echo "::error::no tags to copy"; exit 1; }
+          docker buildx imagetools create "${args[@]}" "${GHCR_IMAGE}@${DIGEST}"
+
+      - name: Check that every Docker Hub tag has the merged digest
+        run: |
+          status=0
+          for tag in ${TAG_NAMES}; do
+            got="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${DOCKERHUB_IMAGE}:${tag}" | jq -r .digest)"
+            if [[ "${got}" == "${DIGEST}" ]]; then
+              echo "ok   ${DOCKERHUB_IMAGE}:${tag} ${got}"
+            else
+              echo "::error::${DOCKERHUB_IMAGE}:${tag} has digest ${got}, expected ${DIGEST}"
+              status=1
+            fi
+          done
+          exit "${status}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the digest on Docker Hub (cosign, keyless)
+        run: cosign sign --yes "${DOCKERHUB_IMAGE}@${DIGEST}"
+
+      - name: Verify the signature
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/publish\\.yml@refs/(heads/master|tags/v[0-9]+\\.[0-9]+\\.[0-9]+)\$" \
+            "${DOCKERHUB_IMAGE}@${DIGEST}" >/dev/null
+          echo "cosign verify: ok"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Copied to Docker Hub: ${DOCKERHUB_IMAGE}@${DIGEST}"
+            echo
+            echo "Same digest as GHCR. Tags:"
+            echo
+            for tag in ${TAG_NAMES}; do printf -- "- \`%s\`\n" "${tag}"; done
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # Replaces the Docker Hub page with docs/dockerhub.md, after the image is there, so the page never
+  # describes tags that do not exist yet. A separate job: a failure of the description API does not
+  # mark the image copy as failed. Part of this workflow, not of its own one, so it only ever runs on
+  # request and in the concurrency group of the run (no push trigger, nothing to race with).
+  dockerhub-description:
+    name: Docker Hub description from docs/dockerhub.md
+    needs: dockerhub
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ needs.dockerhub.outputs.repository }}
+          short-description: Patina - RustDesk hbbs/hbbr server with WebSocket device registration
+          # A short file, not README.md: Docker Hub cuts a description at 25,000 bytes and the action
+          # truncates without an error. Links in it are written relative to the repository root.
+          readme-filepath: ./docs/dockerhub.md
+          enable-url-completion: true
 
   # Tags only. The only job with contents: write.
   release:

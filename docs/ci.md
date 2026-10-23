@@ -2,13 +2,14 @@
 
 Two workflows build, test and publish the image; a third (`upstream-watch.yml`, documented with the
 upstream sync) keeps the fork current. The same files work in any fork unchanged: the image is
-published as `ghcr.io/<repository owner, lowercase>/patina`. No secret is used anywhere except each
-job's own `GITHUB_TOKEN`.
+published as `ghcr.io/<repository owner, lowercase>/patina`. The only secrets are the optional Docker
+Hub ones ([Enabling Docker Hub](#enabling-docker-hub)); everything else uses each job's own
+`GITHUB_TOKEN`.
 
 | Workflow | Runs on | What it does |
 |---|---|---|
 | [`ci.yml`](../.github/workflows/ci.yml) | every pull request, weekly (Mondays), manual | `ci/lint.sh`; `ci/test.sh` (`cargo test --locked`) and an image build + start of `hbbs`/`hbbr`, on a native amd64 and a native arm64 runner (no QEMU); a gitleaks scan of the pull request's commits; a Trivy scan of the built image. The check to require is **CI result**. |
-| [`publish.yml`](../.github/workflows/publish.yml) | on request only: a pushed tag `vX.Y.Z`, or manual "Run workflow" (master or a tag only) | Builds each architecture natively, pushes it to GHCR by digest, smoke-tests the pushed digest (`hbbs --help`, `hbbr --help`, and both start and stay up), merges the two into one manifest list (`linux/amd64`, `linux/arm64` only), tags it, signs it with cosign and attests its provenance. On a tag it also creates the GitHub Release. |
+| [`publish.yml`](../.github/workflows/publish.yml) | on request only: a pushed tag `vX.Y.Z`, or manual "Run workflow" (master or a tag only) | Builds each architecture natively, pushes it to GHCR by digest, smoke-tests the pushed digest (`hbbs --help`, `hbbr --help`, and both start and stay up), merges the two into one manifest list (`linux/amd64`, `linux/arm64` only), tags it, signs it with cosign and attests its provenance. On a tag it also creates the GitHub Release. When the Docker Hub secrets are set, it then copies the same digest to Docker Hub with the same tags, signs it there and replaces the Docker Hub description with [`docs/dockerhub.md`](dockerhub.md). |
 
 ## Scripts
 
@@ -29,7 +30,10 @@ job's own `GITHUB_TOKEN`.
 - `publish.yml` never runs for a pull request. A manual run from another branch fails in the first
   job; a tag must equal `v` + `VERSION` and be a commit of `master`. Write permissions are per job:
   `packages: write` (build, merge), `id-token: write` and `attestations: write` (merge only),
-  `contents: write` (the release job only).
+  `contents: write` (the release job only). The Docker Hub job holds `packages: read` and
+  `id-token: write`; the Docker Hub secrets are visible only to it, to the description job and, as a
+  boolean "are both set", to `prepare`. The token goes only into `with:` of the login and description
+  actions, never into a `run:` script or a step's `env:` (`ci/lint.sh` checks this).
 - Every action is pinned to a commit SHA and every tool image to a digest; the workflows have
   `permissions: {}` at the top. Dependabot bumps the action SHAs and the Dockerfile base images.
   The tool images in `ci/lint.sh` and `ci.yml` (actionlint, shellcheck, hadolint, Trivy, gitleaks)
@@ -70,6 +74,36 @@ cosign verify ghcr.io/<owner>/patina@sha256:<digest> \
    `git tag -s v0.2.0 && git push origin v0.2.0`.
 3. `publish.yml` fails if the tag differs from `VERSION` or is not on `master`. Otherwise it
    publishes `0.2.0`, `0.2`, `latest` and `sha-<short>` and creates the GitHub Release.
+
+## Enabling Docker Hub
+
+Optional; without the secrets the run logs "Docker Hub skipped" and publishes to GHCR only.
+
+1. Create the repository on Docker Hub (for example `<account>/patina`), or let the first push
+   create it.
+2. Create a personal access token (Docker Hub > Account settings > Personal access tokens) with
+   scope **Read, Write, Delete** (the description update needs Delete).
+3. Add the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`. If the Docker Hub
+   repository is not `<DOCKERHUB_USERNAME>/patina`, add the variable `DOCKERHUB_IMAGE` (for example
+   `myorg/patina`, without `docker.io/`).
+4. Run a publish (a tag, or "Run workflow" on `master`).
+
+What happens: the `dockerhub` job, after the image is merged, tagged and signed in GHCR, runs
+`docker buildx imagetools create` from `ghcr.io/.../patina@<digest>` to
+`docker.io/<repository>:<tag>` for every tag of that run. This copies the manifest list as it is, so
+Docker Hub has the identical digest (checked tag by tag), and the job signs and verifies that
+reference with cosign. Then the `dockerhub-description` job replaces the Docker Hub page with
+`docs/dockerhub.md`: a short page (Docker Hub cuts a description at 25,000 bytes, and the action
+truncates without an error; the short description is limited to 100 characters). Links in it are
+relative to the repository root and the action completes them. Keep it in sync with `README.md`
+by hand. The description is updated by every publish and by nothing else: there is no push trigger,
+so a change to `docs/dockerhub.md` reaches Docker Hub with the next publish.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `DOCKERHUB_USERNAME` | secret | Docker Hub account that pushes the image and edits its description |
+| `DOCKERHUB_TOKEN` | secret | Access token of that account, scope Read, Write, Delete |
+| `DOCKERHUB_IMAGE` | variable, optional | Repository on Docker Hub, default `<DOCKERHUB_USERNAME>/patina` |
 
 ## Required repository settings
 
