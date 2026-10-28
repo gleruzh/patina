@@ -110,7 +110,8 @@ jobs:
           path: ${{ runner.temp }}/trivy.sarif
           retention-days: 14
 
-  # Secrets in the commits of the pull request (the whole history on a scheduled or manual run).
+  # Secrets in the commits of the pull request (on a scheduled or manual run: every commit after the
+  # upstream base in UPSTREAM).
   # gitleaks runs as a pinned container: no licence key and no third-party action with a token.
   gitleaks:
     name: Secret scan (gitleaks)
@@ -133,7 +134,13 @@ jobs:
             echo "Scanning the commits ${BASE_SHA}..${HEAD_SHA}"
             opts+=(--log-opts="${BASE_SHA}..${HEAD_SHA}")
           else
-            echo "Scanning the whole history"
+            # Not the whole history: upstream's own past (example KEY_PRIV/KEY_PUB values in its old
+            # READMEs) is not ours to fix and would fail every scheduled run. Scan everything after
+            # the upstream commit in UPSTREAM, which an upstream merge moves forward with it.
+            upstream="$(sed -n 's/^commit=//p' UPSTREAM)"
+            [[ "${upstream}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::UPSTREAM has no valid commit= line"; exit 1; }
+            echo "Scanning the commits ${upstream}..HEAD (everything after the upstream base)"
+            opts+=(--log-opts="${upstream}..HEAD")
           fi
           # safe.directory: the mounted repository belongs to another user than root in the container.
           docker run --rm -v "${PWD}:/repo:ro" \
