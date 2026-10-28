@@ -449,12 +449,22 @@ jobs:
       - name: Verify the signature
         env:
           REPO: ${{ github.repository }}
+        # Docker Hub lists a new referrer (the signature bundle) with a delay, so a verify right after
+        # signing can report "no signatures found" for a signature that is there. Retry for ~2 min.
         run: |
-          cosign verify \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/publish\\.yml@refs/(heads/master|tags/v[0-9]+\\.[0-9]+\\.[0-9]+)\$" \
-            "${DOCKERHUB_IMAGE}@${DIGEST}" >/dev/null
-          echo "cosign verify: ok"
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if cosign verify \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/publish\\.yml@refs/(heads/master|tags/v[0-9]+\\.[0-9]+\\.[0-9]+)\$" \
+              "${DOCKERHUB_IMAGE}@${DIGEST}" >/dev/null; then
+              echo "cosign verify: ok (attempt ${attempt})"
+              exit 0
+            fi
+            echo "cosign verify: not visible yet (attempt ${attempt}), retrying in 15 s"
+            sleep 15
+          done
+          echo "::error::No valid signature for ${DOCKERHUB_IMAGE}@${DIGEST} after 8 attempts."
+          exit 1
 
       - name: Summary
         run: |
