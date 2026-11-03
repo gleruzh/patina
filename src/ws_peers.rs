@@ -358,14 +358,14 @@ async fn writer<S>(
     loop {
         let frame = tokio::select! {
             out = rx.recv() => match out {
-                Some(Out::Frame(bytes)) => WsMessage::Binary(bytes),
+                Some(Out::Frame(bytes)) => WsMessage::Binary(bytes.into()),
                 Some(Out::Close) | None => break,
             },
             _ = ticker.tick() => {
                 if !keepalive.load(Ordering::Relaxed) {
                     continue;
                 }
-                WsMessage::Binary(Vec::new())
+                WsMessage::Binary(Default::default())
             }
         };
         match tokio::time::timeout(SEND_TIMEOUT, sink.send(frame)).await {
@@ -557,11 +557,9 @@ pub(crate) async fn accept(
         client = client_addr(peer, req.headers(), &peers.settings.trusted, conn_id);
         Ok(response)
     };
-    let config = WebSocketConfig {
-        max_message_size: Some(MAX_WS_MESSAGE),
-        max_frame_size: Some(MAX_WS_MESSAGE),
-        ..Default::default()
-    };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE))
+        .max_frame_size(Some(MAX_WS_MESSAGE));
     let ws = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)),
@@ -863,10 +861,10 @@ pub(crate) mod tests {
         assert!(out.try_recv().is_err(), "no keepalive before registration");
         ka.store(true, Ordering::Relaxed);
         assert!(tx.send(b"x".to_vec()));
-        assert_eq!(out.next().await, Some(WsMessage::Binary(b"x".to_vec())));
+        assert_eq!(out.next().await, Some(WsMessage::Binary(b"x".to_vec().into())));
         let start = Instant::now();
         for _ in 0..3 {
-            assert_eq!(out.next().await, Some(WsMessage::Binary(Vec::new())));
+            assert_eq!(out.next().await, Some(WsMessage::Binary(Default::default())));
         }
         let took = start.elapsed();
         assert!(

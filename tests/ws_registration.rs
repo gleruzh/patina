@@ -47,44 +47,66 @@ fn server() -> &'static Server {
         std::env::set_var("WS_REGISTER", "Y");
         std::env::set_var("TEST_HBBS", "no");
         std::env::set_var("RELAY_SERVERS", "127.0.0.1");
-        let port = free_port_triple();
         let key = base64::encode(&sk.0[..]);
-        std::thread::spawn(move || {
-            hbbs::RendezvousServer::start_with_bind(
-                Some("127.0.0.1".parse().unwrap()),
-                port as i32,
-                0,
-                &key,
-                0,
-            )
-            .unwrap();
-        });
-        let ws_port = port + 2;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::net::TcpStream::connect(("127.0.0.1", ws_port)).is_err() {
-            assert!(std::time::Instant::now() < deadline, "hbbs did not start");
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // The ports are not held between probing and hbbs binding them, so
+        // another process may win the race: retry the whole start.
+        for _ in 0..10 {
+            let port = free_port_triple();
+            let key = key.clone();
+            let handle = std::thread::spawn(move || {
+                hbbs::RendezvousServer::start_with_bind(
+                    Some("127.0.0.1".parse().unwrap()),
+                    port as i32,
+                    0,
+                    &key,
+                    0,
+                )
+            });
+            let ws_port = port + 2;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut up = 0;
+            // Ready only when the port accepts connections twice in a row
+            // while our server thread is still running (a failed bind exits it).
+            while up < 2 && !handle.is_finished() && std::time::Instant::now() < deadline {
+                if std::net::TcpStream::connect(("127.0.0.1", ws_port)).is_ok() {
+                    up += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                } else {
+                    up = 0;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            // A foreign listener could have answered before hbbs tried its own
+            // binds; give a failed bind time to exit the thread, then re-check.
+            if up >= 2 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if up >= 2 && !handle.is_finished() {
+                return Server {
+                    ws_port,
+                    licence_key: base64::encode(pk.0),
+                    pk,
+                };
+            }
+            if handle.is_finished() {
+                eprintln!("hbbs start on port {port} failed: {:?}", handle.join());
+            }
         }
-        Server {
-            ws_port,
-            licence_key: base64::encode(pk.0),
-            pk,
-        }
+        panic!("hbbs did not start after 10 attempts");
     })
 }
 
-/// A port p such that p-1, p and p+2 are free (hbbs uses all three).
+/// A port p such that p-1, p and p+2 (all that hbbs uses) are free on both
+/// TCP and UDP, probed on the wildcard address hbbs may bind. Prefers ports
+/// below the ephemeral range to avoid clashing with outgoing connections.
 fn free_port_triple() -> u16 {
-    for _ in 0..200 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        if p < 2000 || p > 65000 {
-            continue;
-        }
+    use std::net::{TcpListener, UdpSocket};
+    let mut seed = std::process::id() as u64 ^ 0x9e37_79b9;
+    for _ in 0..500 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let p = 20_000 + ((seed >> 33) % 10_000) as u16;
         let ok = [p - 1, p, p + 2].iter().all(|q| {
-            std::net::TcpListener::bind(("127.0.0.1", *q)).is_ok()
-                && std::net::UdpSocket::bind(("127.0.0.1", *q)).is_ok()
+            TcpListener::bind(("0.0.0.0", *q)).is_ok() && UdpSocket::bind(("0.0.0.0", *q)).is_ok()
         });
         if ok {
             return p;
@@ -104,7 +126,7 @@ async fn connect(headers: &[(&'static str, &str)]) -> Ws {
 }
 
 async fn send(ws: &mut Ws, m: &RendezvousMessage) {
-    ws.send(WsMessage::Binary(m.write_to_bytes().unwrap()))
+    ws.send(WsMessage::Binary(m.write_to_bytes().unwrap().into()))
         .await
         .unwrap();
 }
@@ -122,7 +144,7 @@ async fn recv(ws: &mut Ws, within: Duration) -> RendezvousMessage {
             .unwrap();
         if let WsMessage::Binary(b) = msg {
             if b.is_empty() {
-                ws.send(WsMessage::Binary(Vec::new())).await.unwrap();
+                ws.send(WsMessage::Binary(Default::default())).await.unwrap();
                 continue;
             }
             return RendezvousMessage::parse_from_bytes(&b).unwrap();
@@ -280,9 +302,9 @@ async fn keepalive_cadence() {
             .expect("no keepalive")
             .unwrap()
             .unwrap();
-        if msg == WsMessage::Binary(Vec::new()) {
+        if msg == WsMessage::Binary(Default::default()) {
             arrivals.push(start.elapsed());
-            dev.ws.send(WsMessage::Binary(Vec::new())).await.unwrap();
+            dev.ws.send(WsMessage::Binary(Default::default())).await.unwrap();
         }
     }
     println!("keepalive arrivals: {arrivals:?}");
@@ -359,9 +381,9 @@ async fn idle_connection_survives_five_minutes() {
             .expect("keepalive missing")
             .expect("connection closed")
             .unwrap();
-        if msg == WsMessage::Binary(Vec::new()) {
+        if msg == WsMessage::Binary(Default::default()) {
             keepalives += 1;
-            dev.ws.send(WsMessage::Binary(Vec::new())).await.unwrap();
+            dev.ws.send(WsMessage::Binary(Default::default())).await.unwrap();
         } else {
             panic!("unexpected {msg:?}");
         }

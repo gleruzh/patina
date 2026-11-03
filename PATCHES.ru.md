@@ -27,6 +27,8 @@ Patina — это исходный проект (upstream)
 | fix(hbbs): a superseded WebSocket cannot take its id back | `src/rendezvous_server.rs` | `RegisterPk` от соединения, у которого более новое соединение забрало id, закрывает его. |
 | fix(hbbs): no version check to api.rustdesk.com unless SOFTWARE_UPDATE_CHECK=Y | `src/common.rs` | `software_update_check_enabled()` управляет вызовом `check_software_update()`, плюс модульный тест. |
 | test: egress check, hbbs and hbbr send nothing on their own | `tests/egress-check.sh` (новый) | Проверка с tcpdump в Docker, с положительным контролем. |
+| fix(hbbr): bound relay writes and frame sizes | `src/relay_server.rs` | У каждой записи в relay есть срок: 30 с плюс len / 16 КиБ/с (масштабируемая часть считается не более чем для 1 МиБ, поэтому максимум 94 с). Сообщения WebSocket в relay ограничены 32 МиБ, а кадры — 16 МиБ. Лимит пакета в 1 МиБ, действующий до образования пары, для смешанных пар TCP-WS поднят до 32 МиБ. Ошибки чтения пишутся в журнал. |
+| deps: bump tungstenite to 0.26 and refresh the lockfile | `Cargo.toml`, `Cargo.lock` | `tungstenite` / `tokio-tungstenite` с 0.17 до 0.26 (RUSTSEC-2023-0065), совместимое обновление `Cargo.lock` и dev-зависимость `tokio` с `test-util`. `src/ws_peers.rs` и `tests/ws_registration.rs` переведены на API 0.26. |
 | коммиты документации | `docs/ws-registration.md`, `PATCHES.md` (новые) | |
 | коммиты сборки, развёртывания, e2e и README | `Dockerfile`, `.dockerignore`, `deploy/`, `tests/e2e/`, `README.md`, `*.ru.md`, `docs/glossary.md` | Новые файлы, кроме `README.md`. Держите их отдельно от коммитов с кодом, чтобы коммиты с кодом переносились на новую базу сами по себе. |
 
@@ -44,15 +46,22 @@ Patina — это исходный проект (upstream)
   * `handle_tcp_punch_hole_request` (сначала маршрут через `ws_peers`);
   * `handle_listener_inner` (ветка `if ws`);
   * модуль тестов (новые тесты и блокировка в `punch_reqs_bounded`).
+* `src/relay_server.rs`: путь записи в relay (`send_bounded`, `write_deadline_ms`),
+  настройки WebSocket для relay (`ws_relay_config`), `prepare_paired` и
+  константы рядом с ними.
+* `Cargo.toml` и `Cargo.lock`: версии `tungstenite` / `tokio-tungstenite`,
+  запись в `[dev-dependencies]` и сам lock-файл. Это файлы Patina: они
+  приходят из репозитория разработки, и слияние upstream нужно разрешать с
+  учётом них.
 * `src/lib.rs`: `mod ws_peers;`.
 * `src/common.rs`: условие `SOFTWARE_UPDATE_CHECK` в начале
   `check_software_update()` и тест в конце модуля тестов.
 
 `src/ws_peers.rs` и `tests/ws_registration.rs` — новые файлы, конфликтов в
 них не будет. Но они зависят от `rendezvous_proto` из hbb_common,
-`tokio-tungstenite` / `tungstenite` 0.17 и `ipnetwork` 0.20 (всё из
-`Cargo.toml` upstream). Обновление любой из этих зависимостей может сломать
-их при компиляции.
+`tokio-tungstenite` / `tungstenite` 0.26 (обновлены в Patina, см. серию
+коммитов) и `ipnetwork` 0.20 (из `Cargo.toml` upstream). Обновление любой из
+этих зависимостей может сломать их при компиляции.
 
 ## Перенос на новый тег upstream
 
@@ -70,7 +79,14 @@ git submodule update --init        # hbb_common at the new upstream pin
 
 1. **Прочитайте изменения upstream в перечисленных выше функциях**, а не
    только конфликты: `git diff $OLD_BASE $NEW_BASE -- src/rendezvous_server.rs
-   src/peer.rs src/common.rs`. В частности:
+   src/peer.rs src/common.rs src/relay_server.rs Cargo.toml Cargo.lock`.
+   В частности:
+   * изменения upstream в relay в `src/relay_server.rs` должны сохранить
+     сроки записи и лимиты размера (сообщение 32 МиБ / кадр 16 МиБ в
+     WebSocket-relay, 32 МиБ для смешанных пар TCP-WS; пары WS-WS изменение
+     лимита до образования пары не затрагивает);
+   * при изменениях upstream в `Cargo.toml` оставляйте `tungstenite` /
+     `tokio-tungstenite` версии 0.26 или новее;
    * любое изменение проверок UDP `RegisterPk` нужно внести в
      `register_pk()`, который теперь обслуживает оба транспорта;
    * для новых веток сообщений в `handle_tcp` нужно решить, относятся ли они

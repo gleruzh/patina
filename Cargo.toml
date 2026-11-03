@@ -42,8 +42,8 @@ headers = "0.3"
 once_cell = "1.8"
 sodiumoxide = "0.2"
 tempfile = "3"
-tokio-tungstenite = "0.17"
-tungstenite = "0.17"
+tokio-tungstenite = "0.26"
+tungstenite = "0.26"
 regex = "1.4"
 tower-http = { version = "0.3", features = ["fs", "trace", "cors"] }
 http = "0.2"
@@ -60,6 +60,9 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
