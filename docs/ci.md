@@ -120,10 +120,17 @@ Notes:
 
 ## Tags and versioning
 
-Patina has its own semver in `VERSION` (`Cargo.toml` keeps upstream's version). The upstream base is
-visible in the image labels `io.patina.upstream.repo` and `io.patina.upstream.commit` (from the
-`UPSTREAM` file), and in every release's notes ("based on rustdesk-server `<commit>`, hbb_common
-`<sha>`").
+Patina has its own semver in `VERSION`; the package version in `Cargo.toml` stays upstream's.
+`Cargo.toml`, `Cargo.lock` and `src/relay_server.rs` carry Patina changes, see
+[PATCHES.md](../PATCHES.md). The upstream base is visible in the image labels
+`io.patina.upstream.repo` and `io.patina.upstream.commit` (from the `UPSTREAM` file), and in every
+release's notes ("based on rustdesk-server `<commit>`, hbb_common `<sha>`").
+
+The development repository is the maintainers' private working repository; its changes reach
+`master` only through a reviewed sync pull request. The three files above come from it, and edits
+made directly to them on this repository's `master` are overwritten by the next sync (forks are
+unaffected). Propose changes as pull requests here; the maintainers carry them into the
+development repository.
 
 | Event | Tags |
 |---|---|
