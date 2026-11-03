@@ -24,6 +24,8 @@ Base: upstream `master` at `873230e35a8805de7fd057e7eb763c46f7a174ef`
 | fix(hbbs): a superseded WebSocket cannot take its id back | `src/rendezvous_server.rs` | `RegisterPk` on a connection that lost its id to a newer one closes it. |
 | fix(hbbs): no version check to api.rustdesk.com unless SOFTWARE_UPDATE_CHECK=Y | `src/common.rs` | `software_update_check_enabled()` gates `check_software_update()`, plus a unit test. |
 | test: egress check, hbbs and hbbr send nothing on their own | `tests/egress-check.sh` (new) | A tcpdump check in Docker, with a positive control. |
+| fix(hbbr): bound relay writes and frame sizes | `src/relay_server.rs` | Every relay write has a deadline of 30 s plus len / 16 KiB/s (the scaled part counts at most 1 MiB, so at most 94 s). WebSocket relay messages are capped at 32 MiB and frames at 16 MiB. The 1 MiB packet limit that applies before a pair forms is raised to 32 MiB for mixed TCP-WS pairs. Read errors are logged. |
+| deps: bump tungstenite to 0.26 and refresh the lockfile | `Cargo.toml`, `Cargo.lock` | `tungstenite` / `tokio-tungstenite` 0.17 to 0.26 (RUSTSEC-2023-0065), plus a compatible `Cargo.lock` refresh and a `tokio` `test-util` dev-dependency. `src/ws_peers.rs` and `tests/ws_registration.rs` follow the 0.26 API. |
 | docs commits | `docs/ws-registration.md`, `PATCHES.md` (new) | |
 | build, deploy, e2e and README commits | `Dockerfile`, `.dockerignore`, `deploy/`, `tests/e2e/`, `README.md`, `*.ru.md`, `docs/glossary.md` | New files, apart from `README.md`. Keep them out of the code commits so the code commits rebase on their own. |
 
@@ -41,15 +43,21 @@ Upstream code touched, which is where conflicts will show up:
   * `handle_tcp_punch_hole_request` (route via `ws_peers` first);
   * `handle_listener_inner` (the `if ws` branch);
   * the tests module (new tests, and a lock in `punch_reqs_bounded`).
+* `src/relay_server.rs`: the relay write path (`send_bounded`, `write_deadline_ms`), the
+  WebSocket relay config (`ws_relay_config`), `prepare_paired`, and the constants next to
+  them.
+* `Cargo.toml` and `Cargo.lock`: the `tungstenite` / `tokio-tungstenite` versions, a
+  `[dev-dependencies]` entry, and the lockfile. These are Patina-owned: they come from the
+  development repository, and an upstream merge has to be resolved against them.
 * `src/lib.rs`: `mod ws_peers;`.
 * `src/common.rs`: the `SOFTWARE_UPDATE_CHECK` gate at the top of
   `check_software_update()`, and a test at the end of the tests module.
 
 `src/ws_peers.rs` and `tests/ws_registration.rs` are new and do not
 conflict. They do depend on hbb_common's `rendezvous_proto`,
-`tokio-tungstenite` / `tungstenite` 0.17 and `ipnetwork` 0.20 (all from
-upstream's `Cargo.toml`). A bump of any of these can break them at compile
-time.
+`tokio-tungstenite` / `tungstenite` 0.26 (bumped by Patina, see the series) and
+`ipnetwork` 0.20 (from upstream's `Cargo.toml`). A bump of any of these can
+break them at compile time.
 
 ## Rebasing onto a new upstream tag
 
@@ -67,7 +75,14 @@ Then, before anything else:
 
 1. **Read upstream's changes to the functions listed above**, not just the
    conflicts: `git diff $OLD_BASE $NEW_BASE -- src/rendezvous_server.rs
-   src/peer.rs src/common.rs`. In particular:
+   src/peer.rs src/common.rs src/relay_server.rs Cargo.toml Cargo.lock`.
+   In particular:
+   * upstream changes to the relay in `src/relay_server.rs` must keep the
+     write deadlines and the size limits (32 MiB message / 16 MiB frame on
+     WebSocket relays, 32 MiB for mixed TCP-WS pairs; WS-WS pairs are
+     unaffected by the pre-pair limit change);
+   * keep `tungstenite` / `tokio-tungstenite` at 0.26 or newer when upstream
+     changes `Cargo.toml`;
    * any change to the UDP `RegisterPk` checks must be applied inside
      `register_pk()`, which now serves both transports;
    * new message arms in `handle_tcp` must decide whether they apply to
