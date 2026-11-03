@@ -90,6 +90,17 @@ if awk '
     fail "${wf}: a secret interpolated into a run: script; pass it through env"
 fi
 
+# Closing older upstream issues needs these three lines of upstream-watch.yml; a rename must not
+# silently turn the closing off.
+echo "upstream-watch.yml hands report what it needs to close older issues"
+uw=.github/workflows/upstream-watch.yml
+grep -qE '^[[:space:]]+sha:[[:space:]]*\$\{\{[[:space:]]*steps\.check\.outputs\.sha[[:space:]]*\}\}' "${uw}" \
+    || fail "${uw}: the job check must expose outputs.sha"
+grep -qE '^[[:space:]]+UPSTREAM_SHA:[[:space:]]*\$\{\{[[:space:]]*needs\.check\.outputs\.sha[[:space:]]*\}\}' "${uw}" \
+    || fail "${uw}: the report step must set UPSTREAM_SHA from needs.check.outputs.sha"
+grep -qE '^[[:space:]]+DEFAULT_BRANCH:[[:space:]]*\$\{\{[[:space:]]*github\.event\.repository\.default_branch[[:space:]]*\}\}' "${uw}" \
+    || fail "${uw}: the report step must set DEFAULT_BRANCH from github.event.repository.default_branch"
+
 # The Docker Hub page: at most 25,000 bytes (a longer one is cut silently), the short description at
 # most 100 characters, and the cosign identity it shows is the one publish.yml verifies.
 echo "docs/dockerhub.md limits"

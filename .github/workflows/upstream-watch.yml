@@ -4,6 +4,10 @@
 # new commits (security-looking ones marked), new tags, the hbb_common pin change and the merge and
 # test result. Older open upstream issues are closed with a pointer to the new one. Upstream master
 # is tracked, not only its tags, because upstream fixes can sit on master for months.
+# Every run also looks at three more upstream sources and opens one issue per finding (reporting
+# only, nothing is built or merged): new commits of hbb_common's main branch past our submodule pin
+# (protocol-touching and security-looking ones marked), new stable RustDesk client releases, and
+# merged / closed state of the upstream rustdesk-server pull requests listed in ci/watched-prs.
 # Once a week (Mondays, UTC, and on manual runs) it also checks that the hbb_common commit pinned
 # here and the commit in UPSTREAM can still be fetched from upstream, and opens an issue when not:
 # the AGPL requires the corresponding source to stay available, so a maintainer must publish a backup.
@@ -16,6 +20,9 @@
 # write permission (issues); it starts from a clean checkout, never builds or runs upstream code,
 # and treats what "trial" produced (commit messages, file names, the log) as untrusted data: values
 # are validated or cut to a length limit and everything free-form goes into code blocks.
+#
+# A manual run on a branch other than the default one reports as usual but closes no older issue
+# (the issues belong to the default branch's UPSTREAM and pin); dispatch it on the default branch.
 #
 # GitHub limitations:
 # - GitHub disables scheduled workflows after 60 days without repository activity (a commit, not
@@ -102,6 +109,33 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Reads git data and the GitHub API of public upstream repositories; builds and runs nothing.
+  watch:
+    name: hbb_common, client releases, watched pull requests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Collect what moved upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUT: ${{ runner.temp }}/upstream-extra
+        run: ci/upstream-check.sh watch
+
+      - name: Keep the result
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upstream-watch-extra
+          path: ${{ runner.temp }}/upstream-extra
+          retention-days: 7
+          if-no-files-found: ignore
+
   availability:
     name: Pinned sources still available
     needs: check
@@ -132,8 +166,10 @@ jobs:
   # The only job with a write permission. Never builds or runs upstream code.
   report:
     name: Open and close issues
-    needs: [check, trial, availability]
-    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.trial.result == 'success' || needs.availability.result == 'success') }}
+    needs: [check, trial, availability, watch]
+    # Deliberately also runs when check failed: the watch sources are still reported. UPSTREAM_SHA is
+    # then empty and closing superseded server issues is skipped.
+    if: ${{ !cancelled() && (needs.trial.result == 'success' || needs.availability.result == 'success' || needs.watch.result == 'success' || needs.watch.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -144,7 +180,9 @@ jobs:
         with:
           persist-credentials: false
 
+      # A job that failed early may have uploaded nothing; report handles every missing part.
       - name: Get the results
+        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: upstream-watch-*
@@ -154,6 +192,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           IN: ${{ runner.temp }}/in
+          UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           FORCE: ${{ inputs.force }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: ci/upstream-check.sh report
+
+      # The download above tolerates a missing artifact (a job that failed early uploads nothing),
+      # but when a job succeeded its result must be there; otherwise the download itself failed.
+      - name: Check that the results arrived
+        if: ${{ !cancelled() }}
+        env:
+          IN: ${{ runner.temp }}/in
+          TRIAL: ${{ needs.trial.result }}
+          AVAILABILITY: ${{ needs.availability.result }}
+          WATCH: ${{ needs.watch.result }}
+        run: |
+          missing=0
+          [[ "${TRIAL}" != success || -f "${IN}/upstream-watch-trial/meta.env" ]] || { echo "::error::trial succeeded but its result was not downloaded"; missing=1; }
+          [[ "${AVAILABILITY}" != success || -f "${IN}/upstream-watch-availability/meta.env" ]] || { echo "::error::availability succeeded but its result was not downloaded"; missing=1; }
+          [[ "${WATCH}" != success || -f "${IN}/upstream-watch-extra/meta.env" ]] || { echo "::error::watch succeeded but its result was not downloaded"; missing=1; }
+          exit "${missing}"
