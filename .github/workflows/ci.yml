@@ -30,7 +30,7 @@ env:
 
 jobs:
   lint:
-    name: Lint (actionlint, shellcheck, hadolint, pins, VERSION)
+    name: Lint and watcher tests (actionlint, shellcheck, hadolint, pins, VERSION, upstream-check)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -41,6 +41,8 @@ jobs:
           persist-credentials: false
       - name: ci/lint.sh
         run: ci/lint.sh
+      - name: ci/upstream-check.test.sh
+        run: ci/upstream-check.test.sh
 
   # The same job on a native runner of each architecture. The test suite is ci/test.sh (also used
   # by upstream-watch.yml); the image is then built from the same tree and started.
