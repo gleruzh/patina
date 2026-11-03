@@ -21,6 +21,83 @@ Hub ones ([Enabling Docker Hub](#enabling-docker-hub)); everything else uses eac
   for the Dockerfile, every `uses:` pinned to a full commit SHA with a `# vX.Y.Z` comment, and
   `VERSION` is `X.Y.Z`. Linters run from `PATH` if installed, else as the pinned containers named in
   the script.
+- `ci/upstream-check.test.sh`: offline tests of the hbb_common, client-release and pull-request
+  parts of `ci/upstream-check.sh` (fixture git repositories and JSON files instead of the network).
+  Needs `git` and `jq`; `ci.yml` runs it in the lint job.
+
+## Upstream watch
+
+`upstream-watch.yml` runs daily and only reports: it opens issues labelled `upstream` and never
+opens a pull request or pushes. Its logic is `ci/upstream-check.sh` (`DRY_RUN=1 ci/upstream-check.sh
+report` prints instead of calling the issues API). One issue is opened per finding; a run looks for
+an existing issue by its title, so a daily run never opens a duplicate (`force` on a manual run
+reports again).
+
+| Source | Reported when | Issue title |
+|---|---|---|
+| rustdesk-server `master` | commits past the `UPSTREAM` commit; also a trial merge and `ci/test.sh` | `upstream: rustdesk-server <sha> — <state>` |
+| hbb_common `main` | commits past the `libs/hbb_common` pin; `*` marks a security-looking message, `P` a commit that touches `protos/` | `upstream: hbb_common main past pin <pin sha>` |
+| RustDesk client releases | a stable `X.Y.Z` release newer than the newest one with an issue (`nightly`, drafts and pre-releases ignored; with no earlier issue only the newest release) | `upstream: rustdesk client <tag>` |
+| watched upstream pull requests | a pull request listed in `ci/watched-prs` is merged or closed | `upstream: PR rustdesk-server#<number> <merged\|closed>` |
+
+Notes:
+
+- The hbb_common branch is `main`, not `master`. Upstream deleted `protos/message.proto` and moved
+  modules after our pin, so a bump is not a plain pin change; the issue says so and the workflow
+  never tries to build the new hbb_common. There is one issue per pin, not per upstream commit:
+  while `main` moves, the open issue gets a comment with only the commits it does not list yet
+  (each comment carries a hidden `hbb-head` marker, so a rerun adds nothing), and a closed issue is
+  left alone. Only text written by the Actions bot is read back: the REST author must be of type
+  `Bot` with the login `github-actions[bot]`, so a marker or commit sha in a stranger's comment
+  cannot suppress a report. This relies on the comments being written with `GITHUB_TOKEN`; if the
+  workflow is switched to a personal access token or an App token, its comments are no longer
+  recognised and the watcher would comment again on every run. After a bump the new pin gets a new
+  issue (none when nothing is past it) and the issues of
+  older pins are closed on every run, so a close that failed is retried the next day. The same
+  holds for the issues of older rustdesk-server master commits: the `report` job gets the newest
+  commit from `check` and, whenever an issue for it exists, closes the open issues of older commits,
+  with or without a trial that day. So an issue that someone reopens is closed again on the next run.
+  Older issues are closed only on a run of the default branch: a manual "Run workflow" on another
+  branch reports as usual but closes nothing, so dispatch the watcher on the default branch.
+  Lists are cut to the newest 100 commits; if more than 100 land between two
+  runs, the older ones are not listed in the comment (the compare link has them).
+- Which server issue is "older" is judged by the issue's creation time, not by commit ancestry: the
+  report job has no clone of upstream. Only issues created before the issue of the newest commit are
+  closed, so a newer issue stays open when an older sha is handed in. The default branch comes from
+  the workflow (`github.event.repository.default_branch`), else from the API; when neither is
+  known the run warns ("default branch unknown") and closes nothing. `ci/lint.sh` checks that the
+  workflow still passes `UPSTREAM_SHA` and `DEFAULT_BRANCH` and that `check` exposes `sha`. A final
+  step of `report` fails when `trial`, `availability` or `watch` succeeded but their result was not
+  downloaded; `availability` writes a completion marker (`meta.env`) because an empty `missing.txt`
+  may not survive the artifact upload.
+- The client drives protocol changes the server must follow (1.5.0 brought key exchange v1 and
+  WebRTC fields), so a new release is a prompt to read its notes, not a failure.
+- `ci/watched-prs` is a plain file: one pull request number per line, `#` starts a comment. Remove a
+  line when it is dealt with.
+- Failures are loud: each API call is tried 3 times. A watched pull request that cannot be read, a
+  404 (deleted or renumbered) included, fails the `watch` job and the log names the line in
+  `ci/watched-prs`; so does a failing releases call. The three sources are collected independently,
+  so one failure does not hide the others: each finished source writes `hbb_done=1`, `client_done=1`
+  or `prs_done=1`, `report` handles only the sources with their marker, and the job turns red at the
+  end. `report` runs when `watch` failed too (and when `check` failed), uses what was marked, and
+  a missing artifact is tolerated, but a final step fails the job when `watch` succeeded and its
+  result was not downloaded. A failing section of `report` (for example `gh issue create`)
+  does not skip the later ones; the job fails at the end.
+- A hbb_common pin that is not in the history of upstream `main` (a rewritten history, or a pin from
+  another branch) opens one issue per pin, `upstream: hbb_common pin <sha> not on main`; no commits
+  are listed then; the issue is closed when the pin moves. The weekly `availability` job separately
+  covers a pin that cannot be fetched.
+- Duplicate checks read the plain list of `upstream` issues (open and closed, up to 1000) and match
+  titles locally; a search is not used, because its index lags and a miss would open a duplicate.
+  At 1000 issues the run warns that older ones may be missing.
+- Deliberate limits: client releases are reported only when newer than the highest tag already
+  reported, so a late back-port on an older line is ignored, and `force` does not report clients
+  again. The first run on a repository can open several issues at once (the hbb_common head, the
+  newest client release, every watched pull request already merged or closed). The security mark is a
+  hint only: it matches `security`, `cve`, `vuln` and the words `fix`, `fixes`, `fixed`.
+- The `watch` job only reads git objects and API answers of public repositories (`contents: read`).
+  Upstream code is merged and run only in the job `trial`, as before; the job `report` still holds
+  the only write permission and treats everything from the other jobs as data.
 
 ## Trust boundaries
 
