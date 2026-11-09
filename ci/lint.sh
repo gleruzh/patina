@@ -101,6 +101,27 @@ grep -qE '^[[:space:]]+UPSTREAM_SHA:[[:space:]]*\$\{\{[[:space:]]*needs\.check\.
 grep -qE '^[[:space:]]+DEFAULT_BRANCH:[[:space:]]*\$\{\{[[:space:]]*github\.event\.repository\.default_branch[[:space:]]*\}\}' "${uw}" \
     || fail "${uw}: the report step must set DEFAULT_BRANCH from github.event.repository.default_branch"
 
+# report reads IN/<artifact name>/; download-artifact with a pattern unpacks there only when two or
+# more artifacts match, so download by name; drop failed downloads before report, check after it.
+echo "upstream-watch.yml downloads results by name, cleans up before and checks after reporting"
+if grep -qE '^[[:space:]]+pattern:' "${uw}"; then
+    fail "${uw}: download results by name (one step per artifact), not by pattern"
+fi
+for n in trial availability extra; do
+    grep -qE "^[[:space:]]+path:[[:space:]]*\\$\{\{[[:space:]]*runner\.temp[[:space:]]*\}\}/in/upstream-watch-${n}\$" "${uw}" \
+        || fail "${uw}: no download step with path runner.temp/in/upstream-watch-${n}"
+    # the download and its retry, and the producing job's upload, all use the same name
+    [[ "$(grep -cE "^[[:space:]]+name:[[:space:]]*upstream-watch-${n}\$" "${uw}")" -ge 3 ]] \
+        || fail "${uw}: name: upstream-watch-${n} must appear in the upload, the download and its retry"
+done
+cln="$(grep -n 'name: Remove the results that did not download' "${uw}" | head -n 1 | cut -d: -f1)"
+rep="$(grep -n 'name: Open the issue, close older ones' "${uw}" | head -n 1 | cut -d: -f1)"
+chk="$(grep -n 'name: Check that the results arrived' "${uw}" | head -n 1 | cut -d: -f1)"
+[[ -n "${cln}" && -n "${rep}" && "${cln}" -lt "${rep}" ]] \
+    || fail "${uw}: 'Remove the results that did not download' must come before 'Open the issue, close older ones'"
+[[ -n "${chk}" && -n "${rep}" && "${rep}" -lt "${chk}" ]] \
+    || fail "${uw}: 'Check that the results arrived' must come after 'Open the issue, close older ones'"
+
 # The Docker Hub page: at most 25,000 bytes (a longer one is cut silently), the short description at
 # most 100 characters, and the cosign identity it shows is the one publish.yml verifies.
 echo "docs/dockerhub.md limits"
