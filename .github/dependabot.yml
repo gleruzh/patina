@@ -1,8 +1,10 @@
-# Dependabot proposes updates as pull requests; nothing is bumped silently. It keeps current:
-# - the GitHub Actions pinned by commit SHA in .github/workflows (the version comment is updated too);
-# - the base images in the Dockerfile (ARG RUST_IMAGE / RUNTIME_IMAGE), pinned by tag and digest.
-#   The runtime image is distroless, so a bumped digest is also how OS security fixes reach the
-#   published image; publish.yml republishes when the Dockerfile changes.
+# Dependabot proposes updates as pull requests; nothing is bumped silently. Here it keeps current
+# the GitHub Actions pinned by commit SHA in .github/workflows (the version comment is updated too).
+#
+# There is deliberately NO docker ecosystem here. The Dockerfile comes from the development
+# repository's sync, so a bump of its base images here would be reverted by the next sync. They are
+# bumped in the development repository and arrive through the reviewed sync. A distroless digest
+# bump is how OS security fixes reach the image; publish runs on request.
 #
 # There is deliberately NO cargo ecosystem here. Cargo.toml, Cargo.lock and src/relay_server.rs
 # come from the development repository's sync, so a Dependabot bump here would be overwritten by,
@@ -19,10 +21,3 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: ci
-
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-    commit-message:
-      prefix: build

@@ -14,11 +14,12 @@ Hub ones ([Enabling Docker Hub](#enabling-docker-hub)); everything else uses eac
 ## Scripts
 
 - `ci/test.sh`: the one entry point for tests, used by CI and `upstream-watch.yml`. Runs
-  `cargo test --locked` in the builder image named by `ARG RUST_IMAGE=` in the Dockerfile, with the
-  repository mounted read-only and copied to a scratch directory in the container. Exit code = test
-  result. Run it locally the same way.
+  `cargo test --locked` in the builder image (the `rust-base` stage, or `ARG RUST_IMAGE=` in older
+  Dockerfiles), with the repository mounted read-only and copied to a scratch directory in the
+  container. Exit code = test result. Run it locally the same way.
 - `ci/lint.sh`: actionlint (with shellcheck on the `run:` blocks), shellcheck for `ci/*.sh`, hadolint
-  for the Dockerfile, every `uses:` pinned to a full commit SHA with a `# vX.Y.Z` comment, and
+  for the Dockerfile, every Dockerfile base image (and `ARG *_IMAGE=` default) pinned by digest,
+  every `uses:` pinned to a full commit SHA with a `# vX.Y.Z` comment, and
   `VERSION` is `X.Y.Z`. Linters run from `PATH` if installed, else as the pinned containers named in
   the script.
 - `ci/upstream-check.test.sh`: offline tests of the hbb_common, client-release and pull-request
@@ -118,7 +119,8 @@ Notes:
   boolean "are both set", to `prepare`. The token goes only into `with:` of the login and description
   actions, never into a `run:` script or a step's `env:` (`ci/lint.sh` checks this).
 - Every action is pinned to a commit SHA and every tool image to a digest; the workflows have
-  `permissions: {}` at the top. Dependabot bumps the action SHAs and the Dockerfile base images.
+  `permissions: {}` at the top. Dependabot bumps the action SHAs here; the Dockerfile base images
+  are bumped in the development repository and arrive through the sync.
   The tool images in `ci/lint.sh` and `ci.yml` (actionlint, shellcheck, hadolint, Trivy, gitleaks)
   are bumped by hand: `docker buildx imagetools inspect <image>:<tag>`, replace tag and digest.
 - Images are pushed by digest first and get tags only after the smoke test passed on both
@@ -133,10 +135,11 @@ Patina has its own semver in `VERSION`; the package version in `Cargo.toml` stay
 release's notes ("based on rustdesk-server `<commit>`, hbb_common `<sha>`").
 
 The development repository is the maintainers' private working repository; its changes reach
-`master` only through a reviewed sync pull request. The three files above come from it, and edits
-made directly to them on this repository's `master` are overwritten by the next sync (forks are
-unaffected). Propose changes as pull requests here; the maintainers carry them into the
-development repository.
+`master` only through a reviewed sync pull request. The files listed in its `.patina/allowlist`
+(for example `Cargo.toml`, `Cargo.lock`, `src/relay_server.rs` and the `Dockerfile`) come from that
+sync, and edits made directly to them on this repository's `master`, including any Dependabot bump,
+are overwritten by the next sync (forks are unaffected). Propose changes as pull requests here; the maintainers
+carry them into the development repository.
 
 | Event | Tags |
 |---|---|
@@ -212,5 +215,6 @@ so a change to `docs/dockerhub.md` reaches Docker Hub with the next publish.
 
 There is intentionally no scheduled rebuild workflow. The runtime image is distroless (no package
 manager, no shell), so an unchanged tree does not pick up OS fixes by rebuilding. Dependabot bumps
-the pinned base-image digests in the Dockerfile; merging that pull request changes the Dockerfile,
-which triggers `publish.yml`. The weekly Trivy scan only reports.
+the pinned base-image digests in the Dockerfile in the development repository; the bump reaches this
+repository through the reviewed sync, and the image is republished on request (`publish.yml` runs
+only on a tag or manual run). The weekly Trivy scan only reports.

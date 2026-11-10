@@ -82,8 +82,8 @@ jobs:
           done
 
       # Findings never fail the build (--exit-code 0): they are in base-image packages that this
-      # repository does not control, and Dependabot bumps the base image digests. A scanner that
-      # does not work does fail the step.
+      # repository does not control, and the base image digests are bumped in the development
+      # repository. A scanner that does not work does fail the step.
       - name: Scan the image with Trivy
         id: scan
         run: |
