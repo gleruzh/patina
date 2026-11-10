@@ -1,7 +1,7 @@
 # Stock RustDesk client 1.5.0 on a headless X11 desktop (Xvfb + openbox).
 # Used as the WS-only target device, the UDP-mode device and the controller.
 # The client binary is the unmodified upstream release .deb, verified by sha256.
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 ARG TARGETARCH
 ARG RUSTDESK_VERSION=1.5.0
