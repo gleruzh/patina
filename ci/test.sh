@@ -3,8 +3,9 @@
 # ci/test.sh: the single entry point for the test suite (cargo test --locked). Used by ci.yml and by
 # upstream-watch.yml; run it locally the same way: ci/test.sh
 #
-# The tests run in the builder image named by "ARG RUST_IMAGE=" in the Dockerfile, so the toolchain
-# is exactly the one that builds the published image. The repository is mounted read-only and
+# The tests run in the builder image (the Dockerfile's "FROM <image> AS rust-base" stage, or
+# "ARG RUST_IMAGE=" in older Dockerfiles), so the toolchain is exactly the one that builds the
+# published image. The repository is mounted read-only and
 # copied to a scratch directory inside the container: the working tree is never written to (no
 # target/ directory, no touched db_v2.sqlite3), and the container is removed afterwards.
 # The exit code is the result of cargo test. Needs Docker and network access (apt, crates.io).
@@ -17,9 +18,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root="${PWD}"
 
-rust_image="$(sed -n 's/^ARG RUST_IMAGE=//p' Dockerfile | head -n 1)"
+# FROM may carry flags such as --platform=.
+rust_image="$(sed -En 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]+)[[:space:]]+[Aa][Ss][[:space:]]+[Rr][Uu][Ss][Tt]-[Bb][Aa][Ss][Ee][[:space:]]*$/\2/p' Dockerfile | head -n 1)"
+# A value with $ (FROM ${RUST_IMAGE} AS rust-base) is not an image: use the ARG default instead.
+if [[ -z "${rust_image}" || "${rust_image}" == *'$'* ]]; then
+    # Strip a trailing CR and one pair of surrounding quotes, as ci/lint.sh accepts them.
+    rust_image="$(sed -n 's/^ARG RUST_IMAGE=//p' Dockerfile | head -n 1 | tr -d '\r' | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/")"
+fi
 if [[ -z "${rust_image}" ]]; then
-    echo "ci/test.sh: no 'ARG RUST_IMAGE=' line in the Dockerfile" >&2
+    echo "ci/test.sh: no 'FROM <image> AS rust-base' stage and no 'ARG RUST_IMAGE=' line in the Dockerfile" >&2
+    exit 2
+fi
+if [[ ! "${rust_image}" =~ ^[^[:space:]@]+:[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+    echo "ci/test.sh: the builder image must be name:tag@sha256:<64 hex digits>, got: ${rust_image}" >&2
     exit 2
 fi
 
