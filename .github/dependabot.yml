@@ -6,9 +6,9 @@
 # bumped in the development repository and arrive through the reviewed sync. A distroless digest
 # bump is how OS security fixes reach the image; publish runs on request.
 #
-# There is deliberately NO cargo ecosystem here. Cargo.toml, Cargo.lock and src/relay_server.rs
-# come from the development repository's sync, so a Dependabot bump here would be overwritten by,
-# or conflict with, the next sync. See docs/ci.md ("Tags and versioning").
+# There is deliberately NO cargo ecosystem here. Cargo.toml, Cargo.lock and the other files in the
+# development repository's allowlist come from its sync, so a Dependabot bump here would be
+# overwritten by, or conflict with, the next sync. See docs/ci.md ("Tags and versioning").
 # The tool images pinned in ci/lint.sh and ci.yml are bumped by hand (see docs/ci.md).
 version: 2
 updates:

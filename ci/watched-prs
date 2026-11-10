@@ -4,8 +4,6 @@
 734  # key exchange v0/v1 + WebRTC for client 1.5
 744  # signed KeyExchange for logged-in 1.5 clients
 706  # secure_tcp key exchange
-724  # tungstenite / WebSocket dependencies
 728  # dependency refresh
-723  # relay write timeout
 642  # key enforcement + rate caps
 739  # WebSocket trusted proxies
