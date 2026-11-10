@@ -2,7 +2,8 @@
 #
 # ci/lint.sh: static checks for what this repository owns in CI: actionlint (which also checks
 # the run: blocks of the workflows with shellcheck), the scripts in ci/, hadolint for the
-# Dockerfile, the publish.yml invariants (on request only, no cache, no Docker Hub token in env or
+# Dockerfile, that every Dockerfile base image (and "ARG *_IMAGE=" default) is pinned by digest,
+# the publish.yml invariants (on request only, no cache, no Docker Hub token in env or
 # run:), the Docker Hub page limits, that every "uses:" is pinned to a full commit SHA with a version
 # comment, and that VERSION is a semantic version. Each linter runs from PATH if installed, else as the pinned
 # container below, so the result does not depend on the host. Exit code 0 means clean.
@@ -44,6 +45,36 @@ tool shellcheck "${SHELLCHECK_IMAGE}" ci/*.sh || status=1
 # is not shipped; the runtime image is distroless and pinned by digest.
 echo "hadolint Dockerfile"
 tool hadolint "${HADOLINT_IMAGE}" --no-color --ignore DL3008 Dockerfile || status=1
+
+# Every image a Dockerfile pulls (literal FROM, or "ARG *_IMAGE=" default, quoted or not) is pinned
+# by digest. FROM a stage, scratch or an ${ARG} is not a pull. Covers the Dockerfile and the e2e ones.
+# ARG defaults are checked only for names ending in IMAGE, and "FROM image:${VAR}" forms are not
+# checked (the ${...} makes the FROM look like an ARG reference). Convention: put the whole pinned
+# reference in an *_IMAGE ARG or in a literal FROM.
+# (Lower-casing uses tr: bash 3.2 on macOS has no ${x,,}.)
+echo "every Dockerfile base image is pinned by digest"
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+digest_re='@sha256:[0-9a-f]{64}$'
+check_pins() {
+    local file="$1" stages=" scratch " line image alias_name img_lc
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]+)([[:space:]]+[Aa][Ss][[:space:]]+([^[:space:]]+))? ]]; then
+            image="${BASH_REMATCH[2]}"
+            alias_name="${BASH_REMATCH[4]:-}"
+            img_lc="$(lower "${image}")"
+            if [[ "${image}" != *'$'* && "${stages}" != *" ${img_lc} "* && ! "${image}" =~ ${digest_re} ]]; then
+                fail "${file}: base image not pinned by digest: ${line}"
+            fi
+            [[ -z "${alias_name}" ]] || stages+="$(lower "${alias_name}") "
+        elif [[ "${line}" =~ ^[[:space:]]*ARG[[:space:]]+[A-Za-z0-9_]*IMAGE=[\"\']?([^[:space:]\"\']+) ]]; then
+            [[ "${BASH_REMATCH[1]}" =~ ${digest_re} ]] || fail "${file}: image ARG not pinned by digest: ${line}"
+        fi
+    done <"${file}"
+}
+check_pins Dockerfile
+if [[ -d tests/e2e ]]; then
+    while IFS= read -r f; do check_pins "${f}"; done < <(find tests/e2e -name 'Dockerfile*' -type f | sort)
+fi
 
 # Every action is pinned to a 40-character commit SHA and says which release it is. Local actions
 # (./) are not pinned; docker:// references must carry a digest.
