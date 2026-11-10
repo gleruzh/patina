@@ -80,9 +80,15 @@ Notes:
   so one failure does not hide the others: each finished source writes `hbb_done=1`, `client_done=1`
   or `prs_done=1`, `report` handles only the sources with their marker, and the job turns red at the
   end. `report` runs when `watch` failed too (and when `check` failed), uses what was marked, and
-  a missing artifact is tolerated, but a final step fails the job when `watch` succeeded and its
-  result was not downloaded. A failing section of `report` (for example `gh issue create`)
-  does not skip the later ones; the job fails at the end.
+  a missing artifact is tolerated. Each result is downloaded by name into `in/<artifact name>/`
+  (not with `pattern:`: a single match is unpacked straight into `in/`, which hid the data from
+  `report` when `trial` was skipped). A failed download is retried once, after its directory is
+  removed (it can leave partial files) and a short pause. The step "Remove the results that did not
+  download" runs before `report` and removes the directory of a download whose retry failed too, so
+  `report` reads only intact data and one lost artifact does not hide the other sources. The step
+  "Check that the results arrived" runs after `report` and fails the job when a job that succeeded
+  has no result. A failing section of `report` (for example `gh issue create`) does not skip the
+  later ones; the job fails at the end.
 - A hbb_common pin that is not in the history of upstream `main` (a rewritten history, or a pin from
   another branch) opens one issue per pin, `upstream: hbb_common pin <sha> not on main`; no commits
   are listed then; the issue is closed when the pin moves. The weekly `availability` job separately

@@ -176,19 +176,109 @@ jobs:
       contents: read   # check out this repository's own script
       issues: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # A job that failed early may have uploaded nothing; report handles every missing part.
-      - name: Get the results
+      # Downloaded by name, not `pattern:`: with exactly one match download-artifact unpacks straight
+      # into `path` instead of `path/<name>/`, and report found no meta.env. A job that failed early
+      # may have uploaded nothing (report copes). A failed download (a digest mismatch included) may
+      # leave partial files, so its directory is removed before the one retry (after a short pause), and
+      # again by the cleanup step below if the retry fails too: report sees no data, never unverified data.
+      - name: Get the trial result
+        id: dl_trial
+        if: ${{ !cancelled() && (needs.trial.result == 'success' || needs.trial.result == 'failure') }}
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: upstream-watch-*
-          path: ${{ runner.temp }}/in
+          name: upstream-watch-trial
+          path: ${{ runner.temp }}/in/upstream-watch-trial
 
+      - name: Clean up before retrying the trial download
+        if: ${{ steps.dl_trial.outcome == 'failure' }}
+        run: |
+          rm -rf "${RUNNER_TEMP}/in/upstream-watch-trial"
+          sleep 15
+
+      - name: Get the trial result (retry)
+        id: dl_trial_retry
+        if: ${{ steps.dl_trial.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch-trial
+          path: ${{ runner.temp }}/in/upstream-watch-trial
+
+      - name: Get the availability result
+        id: dl_availability
+        if: ${{ !cancelled() && (needs.availability.result == 'success' || needs.availability.result == 'failure') }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch-availability
+          path: ${{ runner.temp }}/in/upstream-watch-availability
+
+      - name: Clean up before retrying the availability download
+        if: ${{ steps.dl_availability.outcome == 'failure' }}
+        run: |
+          rm -rf "${RUNNER_TEMP}/in/upstream-watch-availability"
+          sleep 15
+
+      - name: Get the availability result (retry)
+        id: dl_availability_retry
+        if: ${{ steps.dl_availability.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch-availability
+          path: ${{ runner.temp }}/in/upstream-watch-availability
+
+      - name: Get the watch result
+        id: dl_watch
+        if: ${{ !cancelled() && (needs.watch.result == 'success' || needs.watch.result == 'failure') }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch-extra
+          path: ${{ runner.temp }}/in/upstream-watch-extra
+
+      - name: Clean up before retrying the watch download
+        if: ${{ steps.dl_watch.outcome == 'failure' }}
+        run: |
+          rm -rf "${RUNNER_TEMP}/in/upstream-watch-extra"
+          sleep 15
+
+      - name: Get the watch result (retry)
+        id: dl_watch_retry
+        if: ${{ steps.dl_watch.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: upstream-watch-extra
+          path: ${{ runner.temp }}/in/upstream-watch-extra
+
+      # A directory whose first download failed and whose final result is not a success is removed
+      # (also when the retry was skipped), so no partial directory survives for report to read.
+      - name: Remove the results that did not download
+        if: ${{ !cancelled() }}
+        env:
+          IN: ${{ runner.temp }}/in
+          DL_TRIAL: ${{ steps.dl_trial.outcome }}
+          DL_TRIAL_RETRY: ${{ steps.dl_trial_retry.outcome }}
+          DL_AVAILABILITY: ${{ steps.dl_availability.outcome }}
+          DL_AVAILABILITY_RETRY: ${{ steps.dl_availability_retry.outcome }}
+          DL_WATCH: ${{ steps.dl_watch.outcome }}
+          DL_WATCH_RETRY: ${{ steps.dl_watch_retry.outcome }}
+        run: |
+          [[ "${DL_TRIAL}" != failure || "${DL_TRIAL_RETRY}" == success ]] || rm -rf "${IN}/upstream-watch-trial"
+          [[ "${DL_AVAILABILITY}" != failure || "${DL_AVAILABILITY_RETRY}" == success ]] || rm -rf "${IN}/upstream-watch-availability"
+          [[ "${DL_WATCH}" != failure || "${DL_WATCH_RETRY}" == success ]] || rm -rf "${IN}/upstream-watch-extra"
+
+      # Reports whatever intact directories exist; absent ones are skipped, so a source that failed to
+      # download does not hide the others. A failure here turns the job red like the check below.
       - name: Open the issue, close older ones
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           IN: ${{ runner.temp }}/in
@@ -198,8 +288,9 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: ci/upstream-check.sh report
 
-      # The download above tolerates a missing artifact (a job that failed early uploads nothing),
-      # but when a job succeeded its result must be there; otherwise the download itself failed.
+      # A job that succeeded must have its result (downloaded, meta.env present). A job that failed
+      # reports what it marked, so a failed download there only means no data. Runs after report, so
+      # one missing result does not stop the other sources from being reported; it turns the job red.
       - name: Check that the results arrived
         if: ${{ !cancelled() }}
         env:
