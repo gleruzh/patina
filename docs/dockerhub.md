@@ -1,6 +1,6 @@
 # Patina: RustDesk server (hbbs, hbbr) with WebSocket device registration
 
-Patina is a small fork of [`rustdesk/rustdesk-server`](https://github.com/rustdesk/rustdesk-server) (`hbbs` and `hbbr`). It lets a stock RustDesk client (1.4.0 or newer) with **Use WebSocket** turned on act as a controlled device when it can reach the server only through `wss://<domain>:443`, for example behind an nginx reverse proxy. The client is not modified. Only `hbbs` is patched; `hbbr` is upstream code.
+Patina is a small fork of [`rustdesk/rustdesk-server`](https://github.com/rustdesk/rustdesk-server) (`hbbs` and `hbbr`). It lets a stock RustDesk client (1.4.0 or newer) with **Use WebSocket** turned on act as a controlled device when it can reach the server only through `wss://<domain>:443`, for example behind an nginx reverse proxy. The client is not modified. `hbbs` is patched (WebSocket device registration); `hbbr` is upstream code plus a size-scaled relay write deadline and, after pairing, a 32 MiB message limit on legs of a pair with a WebSocket side (upstream: no limit on framed legs, 64 MiB on WebSocket).
 
 Patina is an independent project. It is not affiliated with or endorsed by the RustDesk project or its owners.
 

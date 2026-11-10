@@ -129,17 +129,20 @@ Notes:
 ## Tags and versioning
 
 Patina has its own semver in `VERSION`; the package version in `Cargo.toml` stays upstream's.
-`Cargo.toml`, `Cargo.lock` and `src/relay_server.rs` carry Patina changes, see
-[PATCHES.md](../PATCHES.md). The upstream base is visible in the image labels
+Patina's changes are listed in [PATCHES.md](../PATCHES.md). `Cargo.toml` is upstream's plus a tokio
+`test-util` dev-dependency; `Cargo.lock` is upstream's lock with the registry crates refreshed by
+Patina (git dependencies at upstream's revisions). The upstream base is visible in the image labels
 `io.patina.upstream.repo` and `io.patina.upstream.commit` (from the `UPSTREAM` file), and in every
 release's notes ("based on rustdesk-server `<commit>`, hbb_common `<sha>`").
 
 The development repository is the maintainers' private working repository; its changes reach
 `master` only through a reviewed sync pull request. The files listed in its `.patina/allowlist`
-(for example `Cargo.toml`, `Cargo.lock`, `src/relay_server.rs` and the `Dockerfile`) come from that
-sync, and edits made directly to them on this repository's `master`, including any Dependabot bump,
-are overwritten by the next sync (forks are unaffected). Propose changes as pull requests here; the maintainers
-carry them into the development repository.
+come from the reviewed sync: patched upstream source files such as `src/rendezvous_server.rs` and
+`src/relay_server.rs`, `Cargo.toml`, `Cargo.lock`, the `Dockerfile`, `.dockerignore`, the README and
+patch notes, some of Patina's docs, `deploy/` and the tests. Edits made directly to them on this
+repository's `master`, including any Dependabot bump, are overwritten by the next sync (forks are
+unaffected). Propose changes as pull requests here; the maintainers carry them into the
+development repository.
 
 | Event | Tags |
 |---|---|
