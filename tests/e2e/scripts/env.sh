@@ -2,9 +2,10 @@
 E2E_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export E2E_STATE=${E2E_STATE:-${TMPDIR:-/tmp}/patina-e2e-state}
 export E2E_STATE=${E2E_STATE%/}
-export HBBS_IMAGE=${HBBS_IMAGE:-patina-e2e-hbbs:stock-873230e}
-# hbbr is stock in every run (no hbbr changes are expected).
-export HBBR_IMAGE=${HBBR_IMAGE:-patina-e2e-hbbs:stock-873230e}
+export HBBS_IMAGE=${HBBS_IMAGE:-patina-e2e-hbbs:stock-680b603}
+# hbbr is the stock upstream image in e2e; Patina's relay limits are covered by
+# unit tests in src/relay_server.rs.
+export HBBR_IMAGE=${HBBR_IMAGE:-patina-e2e-hbbs:stock-680b603}
 export CLIENT_IMAGE=${CLIENT_IMAGE:-patina-e2e-client:1.5.0}
 export PROBE_IMAGE=${PROBE_IMAGE:-patina-e2e-probe:latest}
 export RD_PASSWORD=${RD_PASSWORD:-E2e-Pass-4821}

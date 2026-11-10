@@ -38,7 +38,7 @@ services:
       proxy: { ipv4_address: 10.231.4.11 }
 
   hbbs:
-    image: ${HBBS_IMAGE:-patina-e2e-hbbs:stock-873230e}
+    image: ${HBBS_IMAGE:-patina-e2e-hbbs:stock-680b603}
     container_name: patina-e2e-hbbs
     network_mode: service:edge
     depends_on: [edge]
@@ -55,7 +55,7 @@ services:
       - patina-e2e-hbbs-data:/data
 
   hbbr:
-    image: ${HBBR_IMAGE:-patina-e2e-hbbs:stock-873230e}
+    image: ${HBBR_IMAGE:-patina-e2e-hbbs:stock-680b603}
     container_name: patina-e2e-hbbr
     network_mode: service:edge
     depends_on: [edge, hbbs]

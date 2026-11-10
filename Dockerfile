@@ -15,13 +15,15 @@
 # The root filesystem can be read-only; no capabilities are needed (all ports
 # are > 1024). See deploy/ for a compose example.
 
-# Base images are pinned by manifest-list digest (multi-arch). To bump: run
+# Base images are pinned by manifest-list digest (multi-arch) in literal FROM lines, which
+# Dependabot can bump (it cannot follow `FROM ${ARG}`). Keep the stage name rust-base:
+# the public repository's ci/test.sh reads it. Manual bump: run
 #   docker buildx imagetools inspect <image>:<tag>
 # and replace both the tag and the digest.
-ARG RUST_IMAGE=rust:1.99.1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
+FROM rust:1.99.1-slim-trixie@sha256:4df2ae8cfdfebdfc13a65da7f253b73d68983dc0339f2719bc17a279c913b13d AS rust-base
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS runtime-base
 
-FROM ${RUST_IMAGE} AS builder
+FROM rust-base AS builder
 ARG TARGETARCH
 
 # make: libsodium-sys builds the bundled libsodium. libssl-dev: native-tls is
@@ -47,7 +49,7 @@ RUN --mount=type=cache,id=patina-cargo-registry,target=/usr/local/cargo/registry
  && mkdir -p /out/bin /out/data \
  && cp target/release/hbbs target/release/hbbr target/release/rustdesk-utils /out/bin/
 
-FROM ${RUNTIME_IMAGE}
+FROM runtime-base
 
 LABEL org.opencontainers.image.title="patina" \
       org.opencontainers.image.description="hbbs/hbbr with WebSocket device registration (fork of rustdesk-server)" \
