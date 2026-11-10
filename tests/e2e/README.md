@@ -45,7 +45,8 @@ Nothing is pruned, and nothing is installed on the host. The scripts need only
   `api-server=https://rd.e2e.test` and `allow-websocket=Y`. Unattended access
   uses a permanent password.
 * hbbs runs `-r rd.e2e.test -k _` with `read_only`, `cap_drop: [ALL]`,
-  `no-new-privileges` and uid 1000. hbbr is always the stock image, `-k _`.
+  `no-new-privileges` and uid 1000. hbbr is always the stock upstream image, `-k _`
+  (Patina's relay limits are covered by unit tests in `src/relay_server.rs`).
   The bench sets `WS_REGISTER=Y` and
   `TRUSTED_PROXY_CIDRS=10.231.4.0/24`, a `proxy` network that holds only
   nginx and edge, the same way a reverse proxy joins `rustdesk-net` in production. Stock
@@ -81,7 +82,7 @@ Nothing is pruned, and nothing is installed on the host. The scripts need only
 
 ```bash
 cd tests/e2e
-scripts/build-stock.sh                       # stock hbbs/hbbr from 873230e (git archive, ~10 min)
+scripts/build-stock.sh                       # stock hbbs/hbbr from 680b603 (git archive, ~10 min)
 # patched build from exact commits, no checkout (context = git archive + hbb_common at its pin):
 scripts/build-image.sh <hbbs-commit> --dockerfile <packaging-commit>:Dockerfile   # -> patina-e2e-hbbs:<sha7>
 docker build -t patina-e2e-client:1.5.0 client

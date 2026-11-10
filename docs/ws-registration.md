@@ -13,8 +13,9 @@ version check to `api.rustdesk.com` (see
 
 Nothing changes on the client. The stock client (1.4.0 or newer, checked
 against the 1.5.0 source) already speaks this protocol, because the Pro server
-supports it. `hbbr` is unchanged
-too, since it already accepts WebSocket.
+supports it. `hbbr` needs no change for
+this, since it already accepts WebSocket; Patina only adds relay write and
+paired-leg limits to it (see [PATCHES.md](../PATCHES.md#differences-from-upstream)).
 
 Upstream's OSS `hbbs` registers devices only over UDP. Over TCP/WebSocket it
 answers `RegisterPk` with `NOT_SUPPORT` and closes the socket, so a
@@ -97,9 +98,11 @@ calls into it (see [PATCHES.md](../PATCHES.md)).
 ### Addresses behind a proxy
 
 Upstream trusted `X-Real-IP` / `X-Forwarded-For` from anyone who could reach
-21118, and rewrote the address to `IP:0`. That let a direct client choose its
-IP (and dodge the IP blocker), and it made two controllers behind one NAT
-collide in `tcp_punch`, so one of them got the other's answer.
+21118. Before e5c0a42 it rewrote the address to `IP:0`; since e5c0a42 it keeps
+the proxy connection's TCP port, but still trusts the headers from any peer.
+That lets a direct client choose its IP (and dodge the IP blocker). Patina adds
+the `TRUSTED_PROXY_CIDRS` gate, fail-closed handling of repeated or conflicting
+headers, and `X-Real-Port`.
 
 Now:
 
@@ -140,7 +143,7 @@ Other settings that matter here:
   publish them**: only the proxy should reach them.
 
 The connection limits also apply when `WS_REGISTER=N`: the 10 s handshake
-timeout, the 64 KiB message cap, and `MAX_WS_CONN_PER_IP`. So does the proxy
+timeout, the message cap (`MAX_MESSAGE_KB`, default 64 KiB), and `MAX_WS_CONN_PER_IP`. So does the proxy
 header rule. An upstream setup that relied on hbbs trusting `X-Real-IP` from
 any peer needs `TRUSTED_PROXY_CIDRS` after switching to Patina.
 
@@ -226,7 +229,7 @@ rendezvous path can deny service, but it cannot read sessions.
 | Kick a device off by reconnecting | Replacing the route needs a `RegisterPk` that passes the uuid/pk checks, as above. |
 | Spoof the client IP (to evade the IP blocker or pollute logs) | Proxy headers only from `TRUSTED_PROXY_CIDRS`; repeated, unparsable or disagreeing headers fail closed to the proxy address. 21118/21119 must not be published. |
 | Learn a WS device's IP | WS devices always relay, so controllers see only hbbr. `RequestRelay` to a WS device must name a relay from `-r`. `FetchLocalAddr` is answered with a relay as well. |
-| Exhaust memory / connections | Bounded per-connection channel; `MAX_WS_PEERS`; `MAX_WS_CONN_PER_IP`; 10 s handshake timeout; 64 KiB message cap; 30 s read timeout for silent connections; upstream's IP blocker and `reg_pk` throttle on `RegisterPk`. No map lock is held across `.await`. |
+| Exhaust memory / connections | Bounded per-connection channel; `MAX_WS_PEERS`; `MAX_WS_CONN_PER_IP`; 10 s handshake timeout and 10 s write deadline; `MAX_MESSAGE_KB` message cap (default 64 KiB); 30 s read timeout for silent connections; upstream's IP blocker and `reg_pk` throttle on `RegisterPk`. No map lock is held across `.await`. |
 | Identify or track the server host from outside | hbbs does not phone home. Upstream's version check, which sends a host fingerprint to `api.rustdesk.com` at start and then daily, runs only with `SOFTWARE_UPDATE_CHECK=Y`. See [Outbound connections](#outbound-connections). |
 | Intercept the rendezvous hop | TLS to the proxy (the client skips KeyExchange in WS mode). The proxy-to-hbbs hop is plain HTTP on the docker network. A MITM without the server key cannot forge the signed device key, but can see metadata and deny service. |
 
@@ -240,13 +243,15 @@ Accepted risks:
   devices it is upstream's behaviour.
 * Loopback is always a trusted proxy, so a process inside the hbbs container
   could set the headers.
-* hbbr is unchanged and still trusts `X-Real-IP` from whoever reaches 21119.
+* hbbr does not read these headers differently from upstream and still trusts `X-Real-IP` from whoever reaches 21119.
   Keep 21119 unpublished.
 * hbbs logs device ids and client IPs, as upstream does.
 * Whoever sends a `RelayResponse` or `PunchHoleSent` over TCP/WebSocket picks
   the controller it goes to by address, as upstream. Patina makes these
-  addresses unique per connection (`X-Real-Port` or the connection id instead
-  of `IP:0`). That stops two controllers behind one NAT from getting each
+  addresses unique per connection (`X-Real-Port` or a per-connection port;
+  upstream since e5c0a42 keeps the proxy connection's port, before it used
+  `IP:0`).
+  That stops two controllers behind one NAT from getting each
   other's answers. The addresses are still not secret. A forged answer can
   point a waiting controller at another relay. It cannot impersonate the
   device, because the controller checks the device key signed by the server

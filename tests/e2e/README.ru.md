@@ -1,5 +1,5 @@
 [English](README.md) | Русский
-<!-- en-source: tests/e2e/README.md @ 6e9beb1862323591a2d142ef236127a8bd7dda7f -->
+<!-- en-source: tests/e2e/README.md @ 60566cf18dcc7d107138a4de3039e67de3ef52b5 -->
 
 # Сквозной (e2e) стенд: стандартный клиент RustDesk 1.5.0 как устройство, работающее только через WebSocket
 
@@ -49,7 +49,8 @@
   присмотра используется постоянный пароль.
 * `hbbs` запускается как `-r rd.e2e.test -k _` с `read_only`,
   `cap_drop: [ALL]`, `no-new-privileges` и uid 1000. `hbbr` — всегда
-  стандартный образ, `-k _`. Стенд задаёт `WS_REGISTER=Y` и
+  стандартный образ upstream, `-k _` (ограничения relay Patina проверяются
+  модульными тестами в `src/relay_server.rs`). Стенд задаёт `WS_REGISTER=Y` и
   `TRUSTED_PROXY_CIDRS=10.231.4.0/24` — сеть `proxy`, в которой находятся
   только nginx и edge, так же как обратный прокси подключается к `rustdesk-net` на рабочем
   сервере. Стандартный `hbbs` обе переменные игнорирует.
@@ -86,7 +87,7 @@
 
 ```bash
 cd tests/e2e
-scripts/build-stock.sh                       # stock hbbs/hbbr from 873230e (git archive, ~10 min)
+scripts/build-stock.sh                       # stock hbbs/hbbr from 680b603 (git archive, ~10 min)
 # patched build from exact commits, no checkout (context = git archive + hbb_common at its pin):
 scripts/build-image.sh <hbbs-commit> --dockerfile <packaging-commit>:Dockerfile   # -> patina-e2e-hbbs:<sha7>
 docker build -t patina-e2e-client:1.5.0 client
