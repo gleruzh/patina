@@ -54,8 +54,6 @@ use tungstenite::{
 
 /// Frames queued for one connection before new ones are dropped.
 const CHANNEL_CAP: usize = 32;
-/// Rendezvous messages are small; the largest is an OnlineRequest listing peers.
-const MAX_WS_MESSAGE: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const UNTRUSTED_HEADER_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -557,9 +555,13 @@ pub(crate) async fn accept(
         client = client_addr(peer, req.headers(), &peers.settings.trusted, conn_id);
         Ok(response)
     };
+    // Same bounds and buffers as upstream's WebSocket path (MAX_MESSAGE_KB, default 64 KiB).
+    use crate::rendezvous_server::{MAX_MESSAGE, WS_BUFFER_SIZE, WS_DEFAULT_MAX_FRAME_SIZE};
     let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE))
-        .max_frame_size(Some(MAX_WS_MESSAGE));
+        .max_message_size(Some(*MAX_MESSAGE))
+        .max_frame_size(Some((*MAX_MESSAGE).min(WS_DEFAULT_MAX_FRAME_SIZE)))
+        .read_buffer_size(WS_BUFFER_SIZE)
+        .write_buffer_size(WS_BUFFER_SIZE);
     let ws = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)),

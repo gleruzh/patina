@@ -25,6 +25,13 @@ the hood every source is turned into a process environment variable, and the
 code then reads that variable — so "flag", "config file" and "env var" are just
 three ways to set the same thing.
 
+Every variable in this document can be set in any of these sources: the
+inherited environment, `.env`, or `--config` (for `hbbs`). `.env`, `--config`
+and flags are applied by overwriting the process environment, so each of them
+overrides a variable of the same name inherited from the environment, and a
+later source overrides an earlier one (flag over `--config` over `.env` over
+inherited environment). The exception is `RUST_LOG`, see below.
+
 For **`hbbr`** the precedence is: **flag** (`-b`, `-p`, `-k`) → **`.env`** →
 **inherited environment**.
 
@@ -44,13 +51,18 @@ in the inherited process environment.
 | `RELAY-SERVERS` | `-r`, `--relay-servers` | *(empty)* | Optional relay server override handed to clients, as comma-separated `host` or `host:port` values. Leave empty when `hbbr` uses the same address as `hbbs` and the standard port `21117`; clients derive it automatically. Set this only when the relay uses a different IP/hostname or a non-standard port. |
 | `RMEM` | `-M`, `--rmem` | `0` (system default) | UDP receive‑buffer size in bytes. Raise the OS limit first: `sudo sysctl -w net.core.rmem_max=52428800`. |
 | *(config file)* | `-c`, `--config` | *(none)* | Path to an extra INI config file (see precedence above). |
-| `TEST_HBBS` 🅴 | *(none)* | *(auto)* | UDP self‑test target checked at start‑up. Set to `no` to skip the check (useful behind some NATs/proxies), or to an explicit `host:port`. |
-| `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
-| `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
-| `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
-| `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
-
-🅴 = set through the inherited process environment.
+| `TEST_HBBS` | *(none)* | *(auto)* | UDP self‑test target checked at start‑up. Set to `no` to skip the check (useful behind some NATs/proxies), or to an explicit `host:port`. |
+| `ALWAYS_USE_RELAY` | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
+| `DB_URL` | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
+| `MAX_DATABASE_CONNECTIONS` | *(none)* | `1` | Size of the SQLite connection pool. |
+| `MAX_PUNCH_REQUESTS` | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
+| `MAX_MESSAGE_KB` | *(none)* | `64` | Largest message, in KiB, that `hbbs` accepts on its TCP and WebSocket listeners; a connection that sends a bigger one is dropped. Capped at `65536`. The default fits an online-status query for about 5000 standard 9–10 digit IDs, fewer with long custom IDs; a client whose query is too big shows no online status. **Patina:** the same bound applies to WebSocket device registration (message and frame; the frame is also capped at 16 MiB). |
+| `WS_REGISTER` | *(none)* | `N` | **Patina.** `Y` enables device registration, heartbeat and online status over WebSocket. See [ws-registration.md](ws-registration.md#configuration). |
+| `TRUSTED_PROXY_CIDRS` | *(none)* | loopback only | **Patina.** Comma/space separated CIDRs or IPs whose `X-Real-IP` / `X-Real-Port` / `X-Forwarded-For` are used on the WebSocket listener; from any other peer the headers are ignored. Applies also with `WS_REGISTER=N`. |
+| `MAX_WS_PEERS` | *(none)* | `10000` | **Patina.** Devices registered over WebSocket at once. |
+| `MAX_WS_CONN_PER_IP` | *(none)* | `64` | **Patina.** Concurrent WebSocket connections per client IP (after proxy resolution). Applies also with `WS_REGISTER=N`. |
+| `WS_KEEPALIVE_SECS` | *(none)* | `12` | **Patina.** Interval of the empty keepalive frame, clamped to 5..20 s. |
+| `SOFTWARE_UPDATE_CHECK` | *(none)* | `N` | **Patina.** `Y` restores upstream's daily version check to `api.rustdesk.com` (it posts a host fingerprint). Off by default. |
 
 > `PORT_FOR_API` / `KEY_FOR_API` are only used by RustDesk Server **Pro** and its
 > API; they have no effect in the open‑source server.
@@ -88,6 +100,8 @@ separate aggregate cap.
 
 These may also be placed in `.env` using the uppercase spellings shown above
 (e.g. `SINGLE_BANDWIDTH=256`).
+
+The relay write deadline and the 32 MiB bound on paired framed/WebSocket legs are Patina's and are not configurable; see [PATCHES.md](../PATCHES.md#differences-from-upstream).
 
 ### Blocklists / blacklists (files, not env vars)
 

@@ -10,7 +10,9 @@ it can reach the server only through `wss://<domain>:443`, for example behind an
 nginx reverse proxy. The device needs no UDP 21116 and no direct TCP
 21115–21119.
 
-The client is not modified. Only `hbbs` is patched; `hbbr` is upstream code.
+The client is not modified. `hbbs` is patched; `hbbr` is upstream code with a
+few relay limits (write deadline scaled to message size, bounded paired legs;
+see below).
 
 > [!NOTE]
 > Patina is an independent project. It is not affiliated with or endorsed by
@@ -37,10 +39,10 @@ adds the missing server side and keeps the diff against upstream small.
 Device registration over WebSocket is off by default. With the default
 `WS_REGISTER=N`, Patina speaks upstream's protocol, with two exceptions that
 always apply: proxy headers are trusted only from `TRUSTED_PROXY_CIDRS`, and
-WebSocket connections get a 10 s handshake timeout, a 64 KiB message cap and
-the `MAX_WS_CONN_PER_IP` limit. An upstream setup that relied on `hbbs`
-trusting `X-Real-IP` from any peer needs `TRUSTED_PROXY_CIDRS` after switching
-to Patina.
+WebSocket connections get a 10 s handshake timeout, a message cap
+(`MAX_MESSAGE_KB`, default 64 KiB) and the `MAX_WS_CONN_PER_IP` limit. An
+upstream setup that relied on `hbbs` trusting `X-Real-IP` from any peer needs
+`TRUSTED_PROXY_CIDRS` after switching to Patina.
 
 Also independent of `WS_REGISTER`: `hbbs` does not phone home. Upstream `hbbs`
 sends a version check with a fingerprint of the host to `api.rustdesk.com` at
@@ -52,7 +54,7 @@ start and then daily. Patina does this only with `SOFTWARE_UPDATE_CHECK=Y`.
 | Idle WebSocket connections | Dropped after about 30 s | The server sends an empty binary frame every 12 s (`WS_KEEPALIVE_SECS`); the client's echo refreshes the device's registration |
 | PunchHole, RequestRelay, FetchLocalAddr to a WebSocket device | Sent over UDP, never arrive | Pushed down the device's WebSocket connection |
 | Online status (`OnlineRequest`) on `/ws/id` | Not answered, devices always show offline | Answered; a live WebSocket device shows online |
-| Two controllers behind one NAT | Both rewritten to `X-Real-IP:0`, which collide | Each gets a unique address from `X-Real-Port` or the connection id |
+| Two controllers behind one NAT | Both got `X-Real-IP:0` and collided (before e5c0a42); since then upstream keeps the proxy connection's port | Trusted-proxy gate; each gets a unique address from `X-Real-Port` or the connection id |
 | `X-Real-IP` / `X-Forwarded-For` | Trusted from any peer | Trusted only from `TRUSTED_PROXY_CIDRS` (default: loopback); the last hop of `X-Forwarded-For` is used |
 | Limits | — | Cap on registered WebSocket devices (`MAX_WS_PEERS`, default 10000) and on concurrent WebSocket connections per IP (`MAX_WS_CONN_PER_IP`, default 64) |
 
@@ -60,10 +62,16 @@ Unchanged:
 
 - UDP registration and the TCP 21115–21117 paths for existing clients.
 - Every upstream security fix up to
-  [`873230e`](https://github.com/rustdesk/rustdesk-server/commit/873230e35a8805de7fd057e7eb763c46f7a174ef),
+  [`680b603`](https://github.com/rustdesk/rustdesk-server/commit/680b60395ecf99a76f74a1d934e453bb6e5e0aa2),
   including the bounded `PUNCH_REQS`, the 253-byte id cap and the 0600 key
   file. UDP `PunchHoleRequest` stays disabled, as upstream decided.
-- `hbbr` and the relay protocol.
+- The relay protocol. `hbbr` differs from upstream only in how it treats slow or
+  oversized relay traffic: a size-scaled write deadline (30 s plus 1 s per 16 KiB,
+  at most 94 s), a completed write counting as activity for the 30 s inactivity
+  check, and a 32 MiB bound per message on paired framed or WebSocket legs.
+  TCP-TCP pairs go raw, as upstream.
+  [PATCHES.md](PATCHES.md#differences-from-upstream) has the full table of limits
+  and the list of what upstream now does itself.
 
 ## Known limitations
 
@@ -85,11 +93,11 @@ Unchanged:
 | [deploy/docker-compose.example.yml](deploy/docker-compose.example.yml) | Docker Compose example for `hbbs` and `hbbr` |
 | [PATCHES.md](PATCHES.md) | The patch set and how to rebase it onto a new upstream tag |
 | [tests/e2e/](tests/e2e/) | End-to-end tests and the test report |
-| [docs/environment-variables.md](docs/environment-variables.md) | Upstream configuration reference (flags, env vars, config files) |
+| [docs/environment-variables.md](docs/environment-variables.md) | Upstream configuration reference (flags, env vars, config files), plus the Patina variables |
 | [docs/glossary.md](docs/glossary.md) | English ↔ Russian glossary for the docs |
 
 Each of these documents has a Russian version next to it with a `.ru.md`
-suffix, except `docs/environment-variables.md`, which is upstream text.
+suffix, except `docs/environment-variables.md`, which is upstream text with the Patina variables added.
 
 ## Building
 
@@ -100,7 +108,7 @@ cargo build --release
 This produces three executables in `target/release`:
 
 - `hbbs`: ID/rendezvous server (patched)
-- `hbbr`: relay server (upstream)
+- `hbbr`: relay server (upstream, with the relay write and paired-leg limits above)
 - `rustdesk-utils`: CLI utilities (upstream)
 
 The multi-stage [`Dockerfile`](Dockerfile) builds the same binaries inside
@@ -174,7 +182,7 @@ published at <https://github.com/gleruzh/patina>. If you run Patina:
 
 - [`rustdesk/rustdesk-server`](https://github.com/rustdesk/rustdesk-server):
   the upstream code, © open-trade / the RustDesk developers, AGPL-3.0. Patina is
-  based on upstream commit `873230e35a8805de7fd057e7eb763c46f7a174ef`.
+  based on upstream commit `680b60395ecf99a76f74a1d934e453bb6e5e0aa2`.
 - [`ymg2006/rustdesk-server`](https://github.com/ymg2006/rustdesk-server)
   (AGPL-3.0): the design of WebSocket sinks keyed by peer id and connection id
   (newest wins, owner-checked cleanup), routing PunchHole, FetchLocalAddr and
